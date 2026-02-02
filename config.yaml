@@ -1,0 +1,3 @@
+# Set Scale
+px_mm = distance=150, known=10, unit=mm
+
