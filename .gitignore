@@ -1,0 +1,20 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+
+# ---- Data ----
+DATA/raw/**
+DATA/processed/**
+
+# Optionally ignore large outputs
+DATA/outputs/**
+
+# ---- OS / Editor ----
+.DS_Store
+Thumbs.db
+.vscode/
