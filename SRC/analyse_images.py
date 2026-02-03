@@ -17,6 +17,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional
+from PIL import Image, ExifTags
 
 import cv2
 import numpy as np
@@ -59,6 +60,57 @@ def read_image(path: Path) -> np.ndarray:
         raise FileNotFoundError(f"Could not read image: {path}")
     return img
 
+EXIF_TAGS = {v: k for k, v in ExifTags.TAGS.items()}
+
+def read_exif(path: Path) -> dict:
+    """
+    Read selected EXIF fields. Missing fields return None.
+    """
+    out = {
+        "exif_focal_length_mm": None,
+        "exif_exposure_time_s": None,
+        "exif_fnumber": None,
+        "exif_iso": None,
+        "exif_exposure_bias": None,
+        "exif_metering_mode": None,
+        "exif_datetime": None,
+        "exif_camera_model": None,
+    }
+
+    try:
+        with Image.open(path) as im:
+            exif = im._getexif()
+            if not exif:
+                return out
+
+            def get(tag):
+                return exif.get(EXIF_TAGS[tag]) if EXIF_TAGS.get(tag) in exif else None
+
+            # Focal length (often a rational)
+            fl = get("FocalLength")
+            if fl:
+                out["exif_focal_length_mm"] = float(fl[0]) / float(fl[1])
+
+            # Exposure time
+            et = get("ExposureTime")
+            if et:
+                out["exif_exposure_time_s"] = float(et[0]) / float(et[1])
+
+            # Aperture
+            fn = get("FNumber")
+            if fn:
+                out["exif_fnumber"] = float(fn[0]) / float(fn[1])
+
+            out["exif_iso"] = get("ISOSpeedRatings")
+            out["exif_exposure_bias"] = get("ExposureBiasValue")
+            out["exif_metering_mode"] = get("MeteringMode")
+            out["exif_datetime"] = get("DateTimeOriginal")
+            out["exif_camera_model"] = get("Model")
+
+    except Exception:
+        pass
+
+    return out
 
 def detect_illuminated_circle(img_bgr: np.ndarray, s: Settings) -> Tuple[np.ndarray, Tuple[int, int, int]]:
     """
@@ -167,13 +219,18 @@ def make_overlay(img_bgr: np.ndarray, circle: Tuple[int, int, int], leaf_labels:
 
 def process_image(path: Path, out_dir: Path, s: Settings) -> pd.DataFrame:
     img = read_image(path)
+    exif = read_exif(path)
+
     circle_mask, circle = detect_illuminated_circle(img, s)
-    leaf_labels = segment_leaves(img, circle_mask, s)
-    roi_area_px = int(np.count_nonzero(circle_mask))
+    if circle is None:
+        raise RuntimeError(f"Failed to detect illuminated ROI in {path}")
+
     cx, cy, r = circle
+    roi_area_px = int(np.count_nonzero(circle_mask))
     roi_diameter_px = float(2.0 * r)
     roi_diameter_eq_px = float(np.sqrt(4.0 * roi_area_px / np.pi))
-    
+
+    leaf_labels = segment_leaves(img, circle_mask, s)
 
     records = []
     fluor_all = np.zeros(leaf_labels.shape, dtype=np.uint8)
@@ -196,26 +253,17 @@ def process_image(path: Path, out_dir: Path, s: Settings) -> pd.DataFrame:
             "fluor_area_px": fluor_area,
             "coverage_pct": coverage,
             "roi_area_px": roi_area_px,
+            "roi_radius_px": float(r),
             "roi_diameter_px": roi_diameter_px,
             "roi_diameter_eq_px": roi_diameter_eq_px,
-            "roi_cx_px": cx,
-            "roi_cy_px": cy,
+            "roi_cx_px": int(cx),
+            "roi_cy_px": int(cy),
+            **exif,
         })
 
-    if s.save_debug:
-        overlay = make_overlay(img, circle, leaf_labels, fluor_all)
-        out_png = out_dir / "qc_overlays" / f"{path.stem}_overlay.png"
-        out_png.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out_png), overlay)
-
-        # Also save intermediate masks if you want
-        masks_dir = out_dir / "qc_masks"
-        masks_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(masks_dir / f"{path.stem}_circle.png"), circle_mask)
-        cv2.imwrite(str(masks_dir / f"{path.stem}_leaves.png"), (leaf_labels > 0).astype(np.uint8) * 255)
-        cv2.imwrite(str(masks_dir / f"{path.stem}_fluor.png"), fluor_all)
-
+    ...
     return pd.DataFrame.from_records(records)
+
 
 
 def main():
