@@ -169,6 +169,11 @@ def process_image(path: Path, out_dir: Path, s: Settings) -> pd.DataFrame:
     img = read_image(path)
     circle_mask, circle = detect_illuminated_circle(img, s)
     leaf_labels = segment_leaves(img, circle_mask, s)
+    roi_area_px = int(np.count_nonzero(circle_mask))
+    cx, cy, r = circle
+    roi_diameter_px = float(2.0 * r)
+    roi_diameter_eq_px = float(np.sqrt(4.0 * roi_area_px / np.pi))
+    
 
     records = []
     fluor_all = np.zeros(leaf_labels.shape, dtype=np.uint8)
@@ -190,6 +195,11 @@ def process_image(path: Path, out_dir: Path, s: Settings) -> pd.DataFrame:
             "leaf_area_px": leaf_area,
             "fluor_area_px": fluor_area,
             "coverage_pct": coverage,
+            "roi_area_px": roi_area_px,
+            "roi_diameter_px": roi_diameter_px,
+            "roi_diameter_eq_px": roi_diameter_eq_px,
+            "roi_cx_px": cx,
+            "roi_cy_px": cy,
         })
 
     if s.save_debug:
@@ -236,6 +246,26 @@ def main():
 
     if all_dfs:
         res = pd.concat(all_dfs, ignore_index=True)
+        # One ROI diameter per image; broadcast back to all rows
+        roi_per_image = (
+            res[["image", "roi_diameter_eq_px"]]
+            .drop_duplicates()
+            .set_index("image")
+        )
+        median_d = float(roi_per_image["roi_diameter_eq_px"].median())
+        
+        roi_per_image["roi_pct_diff"] = 100.0 * (roi_per_image["roi_diameter_eq_px"] - median_d) / median_d
+        # Threshold: tune; 10% is a sensible starting point
+        thr = 10.0
+        roi_per_image["roi_comment"] = np.where(
+            np.abs(roi_per_image["roi_pct_diff"]) >= thr,
+            "roi_diameter_outlier",
+            ""
+        )
+        
+        # merge back onto all leaf rows
+        res = res.merge(roi_per_image.reset_index(), on="image", how="left")
+
         res.to_csv(out_dir / "leaf_fluorescence_results.csv", index=False)
         print(f"Saved: {out_dir / 'leaf_fluorescence_results.csv'}")
 
