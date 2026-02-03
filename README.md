@@ -13,6 +13,20 @@ DATA/raw/ Raw fluorescent images (not tracked)
 DATA/processed/ Processed/masked images (not tracked)
 DATA/outputs/ CSV outputs and summary tables
 
+## Setup
+
+This project must be run inside a Python virtual environment.
+
+### Create the environment
+```bash
+python -m venv .venv
+```
+# activate it
+# Windows
+.venv\Scripts\Activate.ps1
+
+# macOS / Linux
+source .venv/bin/activate
 
 ## Requirements
 
@@ -22,10 +36,12 @@ DATA/outputs/ CSV outputs and summary tables
 - pandas
 - scikit-image
 
-Install dependencies:
+## Install dependencies
 
 ```bash
 pip install -r requirements.txt
+```
+python analyse_images.py --help
 
 
 
