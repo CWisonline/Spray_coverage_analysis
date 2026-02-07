@@ -312,9 +312,9 @@ def analyse_image(path: Path):
             x, y = c
             # draw a small black shadow for readability, then white text
             cv2.putText(vis, str(leaf_id), (x - 10, y + 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(vis, str(leaf_id), (x - 10, y + 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 2, cv2.LINE_AA)
 
 
     return rows, vis
