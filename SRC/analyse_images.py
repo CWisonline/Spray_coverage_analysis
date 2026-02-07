@@ -155,6 +155,18 @@ def draw_contours(img_bgr: np.ndarray, mask01: np.ndarray, color_bgr, thickness:
         cv2.drawContours(out, cnts, -1, color_bgr, thickness)
     return out
 
+def mask_centroid_xy(mask01: np.ndarray) -> tuple[int, int] | None:
+    """
+    Centroid of a binary mask (0/1). Returns (x, y) in pixel coords, or None if empty.
+    """
+    m = mask01.astype(np.uint8)
+    M = cv2.moments(m, binaryImage=True)
+    if M["m00"] == 0:
+        return None
+    cx = int(M["m10"] / M["m00"])
+    cy = int(M["m01"] / M["m00"])
+    return cx, cy
+
 # -----------------------
 # MAIN
 # -----------------------
@@ -292,8 +304,18 @@ def analyse_image(path: Path):
     # Post-shrink illumination (yellow)
     vis = draw_contours(vis, illum_shrunk, (0, 255, 255), thickness=3)
 
-    for _lab, leaf_m, _area in leaf_masks:
-        vis = draw_contours(vis, leaf_m, (0, 255, 0), thickness=2)  # green
+    for leaf_id, (_lab, leaf_m, _area) in enumerate(leaf_masks, start=1):
+        vis = draw_contours(vis, leaf_m, (0, 255, 0), thickness=2)  # green outline
+
+        c = mask_centroid_xy(leaf_m)
+        if c is not None:
+            x, y = c
+            # draw a small black shadow for readability, then white text
+            cv2.putText(vis, str(leaf_id), (x - 10, y + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(vis, str(leaf_id), (x - 10, y + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+
 
     return rows, vis
 
