@@ -150,60 +150,6 @@ def draw_contours(img_bgr: np.ndarray, mask01: np.ndarray, color_bgr, thickness:
         cv2.drawContours(out, cnts, -1, color_bgr, thickness)
     return out
 
-def split_touching_leaves_watershed(
-    leaf_mask01: np.ndarray,
-    min_distance_px: int = 25,
-    sure_fg_frac: float = 0.45,
-) -> np.ndarray:
-    """
-    Marker-controlled watershed to split touching leaves.
-    Returns label image (0=background).
-    """
-
-    mask = (leaf_mask01 > 0).astype(np.uint8)
-
-    # If mask empty → nothing to split
-    if mask.max() == 0:
-        return np.zeros_like(mask, dtype=np.int32)
-
-    # Distance transform
-    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-
-    if dist.max() == 0:
-        # No interior → return simple connected components
-        return cv2.connectedComponents(mask)[1]
-
-    dist_norm = dist / (dist.max() + 1e-6)
-
-    # Sure foreground
-    sure_fg = (dist_norm >= sure_fg_frac).astype(np.uint8)
-
-    # Clean markers
-    k = max(3, (min_distance_px // 2) | 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    sure_fg = cv2.morphologyEx(sure_fg, cv2.MORPH_OPEN, kernel)
-
-    n_markers, markers = cv2.connectedComponents(sure_fg)
-
-    # If no markers → fallback to normal CC
-    if n_markers <= 1:
-        return cv2.connectedComponents(mask)[1]
-
-    # Watershed input image (needs 3-channel)
-    ws_img = cv2.cvtColor((mask * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-
-    markers_ws = markers.astype(np.int32)
-
-    # Ensure background = 0
-    markers_ws[mask == 0] = 0
-
-    cv2.watershed(ws_img, markers_ws)
-
-    labels = markers_ws.copy()
-    labels[labels < 0] = 0
-
-    return labels
-
 # -----------------------
 # MAIN
 # -----------------------
@@ -254,29 +200,19 @@ def analyse_image(path: Path):
     # 2) Leaf ROIs within shrunk illumination: Red <= 120
     leaf0 = ((r <= LEAF_RED_MAX) & (illum_shrunk > 0)).astype(np.uint8)
 
+    # Light cleanup similar to ImageJ open/close (tune if needed)
     leaf0 = cv2.morphologyEx(leaf0, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     leaf0 = cv2.morphologyEx(leaf0, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
 
-    # --- NEW: split touching leaves ---
-    leaf_labels = split_touching_leaves_watershed(
-        leaf0,
-        min_distance_px=25,   # tune: 15–40 typical
-        sure_fg_frac=0.45     # tune: 0.35–0.60 typical
-    )
-
-    # Convert watershed labels to stats similar to connectedComponents
+    n, labels, stats, _ = connected_components(leaf0)
     leaf_masks = []
-    total_leaves = 0
-
-    if leaf_labels.max() > 0:
-        for lab in range(1, int(leaf_labels.max()) + 1):
-            m = (leaf_labels == lab).astype(np.uint8)
-            area = int(m.sum())
-            if area >= MIN_LEAF_AREA_PX:
-                leaf_masks.append((lab, m, area))
+    for lab in range(1, n):
+        area = int(stats[lab, cv2.CC_STAT_AREA])
+        if area >= MIN_LEAF_AREA_PX:
+            m = (labels == lab).astype(np.uint8)
+            leaf_masks.append((lab, m, area))
 
     total_leaves = len(leaf_masks)
-
 
     # Visual base: Blue channel grayscale -> BGR
     vis = cv2.cvtColor(b, cv2.COLOR_GRAY2BGR)
