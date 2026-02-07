@@ -26,10 +26,13 @@ ILLUM_RED_MIN = 5
 LEAF_RED_MAX = 120
 FLUOR_BLUE_MIN = 40
 
+# Scale adjustment for masks (to reduce processing time)
+ILLUM_SCALE = 0.25   # 0.5 or 0.25; 0.25 is usually much faster
+
 # Morphology / filtering
 ILLUM_SHRINK_PX = 150  # large shrink to ensure leaf ROIs are well within illumination (tune if needed)
 MIN_LEAF_AREA_PX = 100_000
-MIN_FLUOR_BLOB_AREA_PX = 10
+MIN_FLUOR_BLOB_AREA_PX = 20
 
 OUT_SUFFIX = "_processed.png"
 
@@ -147,10 +150,64 @@ def draw_contours(img_bgr: np.ndarray, mask01: np.ndarray, color_bgr, thickness:
         cv2.drawContours(out, cnts, -1, color_bgr, thickness)
     return out
 
+def split_touching_leaves_watershed(
+    leaf_mask01: np.ndarray,
+    min_distance_px: int = 25,
+    sure_fg_frac: float = 0.45,
+) -> np.ndarray:
+    """
+    Marker-controlled watershed to split touching leaves.
+    Returns label image (0=background).
+    """
+
+    mask = (leaf_mask01 > 0).astype(np.uint8)
+
+    # If mask empty → nothing to split
+    if mask.max() == 0:
+        return np.zeros_like(mask, dtype=np.int32)
+
+    # Distance transform
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+
+    if dist.max() == 0:
+        # No interior → return simple connected components
+        return cv2.connectedComponents(mask)[1]
+
+    dist_norm = dist / (dist.max() + 1e-6)
+
+    # Sure foreground
+    sure_fg = (dist_norm >= sure_fg_frac).astype(np.uint8)
+
+    # Clean markers
+    k = max(3, (min_distance_px // 2) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    sure_fg = cv2.morphologyEx(sure_fg, cv2.MORPH_OPEN, kernel)
+
+    n_markers, markers = cv2.connectedComponents(sure_fg)
+
+    # If no markers → fallback to normal CC
+    if n_markers <= 1:
+        return cv2.connectedComponents(mask)[1]
+
+    # Watershed input image (needs 3-channel)
+    ws_img = cv2.cvtColor((mask * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+    markers_ws = markers.astype(np.int32)
+
+    # Ensure background = 0
+    markers_ws[mask == 0] = 0
+
+    cv2.watershed(ws_img, markers_ws)
+
+    labels = markers_ws.copy()
+    labels[labels < 0] = 0
+
+    return labels
+
 # -----------------------
 # MAIN
 # -----------------------
-def analyze_image(path: Path):
+def analyse_image(path: Path):
     img_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img_bgr is None:
         raise RuntimeError(f"Failed to read {path}")
@@ -159,44 +216,67 @@ def analyze_image(path: Path):
     r = img_bgr[:, :, 2]
 
     # 1) Illumination ROI (UN-ERODED) from Red >= 5
-    illum0 = (r >= ILLUM_RED_MIN).astype(np.uint8)
-    illum = largest_connected_component(illum0)
+    # --- Illumination mask at reduced scale (for speed) ---
+    h, w = r.shape[:2]
+    scale = float(ILLUM_SCALE)
 
-    # Diameter for zoom QC: widest diameter of the (possibly clipped) illumination shape
-    cnts, _ = cv2.findContours(illum.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    r_small = cv2.resize(r, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+    illum0_small = (r_small >= ILLUM_RED_MIN).astype(np.uint8)
+    illum_small = largest_connected_component(illum0_small)
+
+    # Diameter for zoom QC on the UN-SHRUNK mask (computed on small mask, scaled to full-res px)
+    cnts, _ = cv2.findContours(illum_small.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if cnts:
         cnt = max(cnts, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(cnt)
-        illum_diam = float(max(w, h))
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        illum_diam = float(max(bw, bh)) / scale
     else:
         illum_diam = 0.0
 
-    # Smooth + fill holes so leaves don't punch holes in the lit region
-    illum = cv2.morphologyEx(
-        illum, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
-    )
-    illum = fill_holes(illum)
 
-    # Shrink illumination by 150 px
-    illum_shrunk = shrink_mask_erode(illum, ILLUM_SHRINK_PX)
+    # Smooth + fill holes on the small mask
+    k_close = max(3, int(round(31 * scale)) | 1)  # odd, >=3
+    illum_small = cv2.morphologyEx(
+        illum_small, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
+    )
+    illum_small = fill_holes(illum_small)
+
+    # Shrink on the small mask
+    shrink_small = max(1, int(round(ILLUM_SHRINK_PX * scale)))
+    illum_shrunk_small = shrink_mask_erode(illum_small, shrink_small)
+
+    # Resize masks back to full resolution for downstream steps + overlays
+    illum = cv2.resize(illum_small, (w, h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+    illum_shrunk = cv2.resize(illum_shrunk_small, (w, h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
 
     # 2) Leaf ROIs within shrunk illumination: Red <= 120
     leaf0 = ((r <= LEAF_RED_MAX) & (illum_shrunk > 0)).astype(np.uint8)
 
-    # Light cleanup similar to ImageJ open/close (tune if needed)
     leaf0 = cv2.morphologyEx(leaf0, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     leaf0 = cv2.morphologyEx(leaf0, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
 
-    n, labels, stats, _ = connected_components(leaf0)
+    # --- NEW: split touching leaves ---
+    leaf_labels = split_touching_leaves_watershed(
+        leaf0,
+        min_distance_px=25,   # tune: 15–40 typical
+        sure_fg_frac=0.45     # tune: 0.35–0.60 typical
+    )
+
+    # Convert watershed labels to stats similar to connectedComponents
     leaf_masks = []
-    for lab in range(1, n):
-        area = int(stats[lab, cv2.CC_STAT_AREA])
-        if area >= MIN_LEAF_AREA_PX:
-            m = (labels == lab).astype(np.uint8)
-            leaf_masks.append((lab, m, area))
+    total_leaves = 0
+
+    if leaf_labels.max() > 0:
+        for lab in range(1, int(leaf_labels.max()) + 1):
+            m = (leaf_labels == lab).astype(np.uint8)
+            area = int(m.sum())
+            if area >= MIN_LEAF_AREA_PX:
+                leaf_masks.append((lab, m, area))
 
     total_leaves = len(leaf_masks)
+
 
     # Visual base: Blue channel grayscale -> BGR
     vis = cv2.cvtColor(b, cv2.COLOR_GRAY2BGR)
@@ -220,15 +300,21 @@ def analyze_image(path: Path):
 
             # filter tiny fluorescence blobs
             nf, flab, fstats, _ = connected_components(fluor0)
-            fluor_clean = np.zeros_like(fluor0, dtype=np.uint8)
-            blob_count = 0
-            fluor_area = 0
-            for fl in range(1, nf):
-                a = int(fstats[fl, cv2.CC_STAT_AREA])
-                if a >= MIN_FLUOR_BLOB_AREA_PX:
-                    blob_count += 1
-                    fluor_area += a
-                    fluor_clean[flab == fl] = 1
+
+            # areas for labels 1..nf-1 (skip background)
+            areas = fstats[1:, cv2.CC_STAT_AREA]
+            keep = areas >= MIN_FLUOR_BLOB_AREA_PX
+
+            blob_count = int(keep.sum())
+            fluor_area = int(areas[keep].sum())
+
+            # Build a lookup table for labels to keep (fast)
+            lut = np.zeros(nf, dtype=bool)
+            # labels kept are +1 because areas starts at label 1
+            lut[1:][keep] = True
+
+            fluor_clean = lut[flab].astype(np.uint8)
+
 
             coverage = (100.0 * fluor_area / leaf_area) if leaf_area > 0 else 0.0
 
@@ -268,7 +354,7 @@ def main():
 
     for p in imgs:
         try:
-            rows, vis = analyze_image(p)
+            rows, vis = analyse_image(p)
             all_rows.extend(rows)
             out_img = PROCESSED_DIR / f"{p.stem}{OUT_SUFFIX}"
             cv2.imwrite(str(out_img), vis)
