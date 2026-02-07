@@ -24,7 +24,7 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 # Thresholds (inclusive)
 ILLUM_RED_MIN = 5
 LEAF_RED_MAX = 120
-FLUOR_BLUE_MIN = 40
+FLUOR_BLUE_MIN = 50
 
 # Scale adjustment for masks (to reduce processing time)
 ILLUM_SCALE = 0.25   # 0.5 or 0.25; 0.25 is usually much faster
