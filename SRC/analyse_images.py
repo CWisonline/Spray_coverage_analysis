@@ -24,12 +24,12 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 # Thresholds (inclusive)
 ILLUM_RED_MIN = 5
 LEAF_RED_MAX = 120
-FLUOR_BLUE_MIN = 35
+FLUOR_BLUE_MIN = 40
 
 # Morphology / filtering
 ILLUM_SHRINK_PX = 150  # large shrink to ensure leaf ROIs are well within illumination (tune if needed)
 MIN_LEAF_AREA_PX = 100_000
-MIN_FLUOR_BLOB_AREA_PX = 50
+MIN_FLUOR_BLOB_AREA_PX = 10
 
 OUT_SUFFIX = "_processed.png"
 
@@ -102,40 +102,40 @@ def shrink_mask_erode(mask01: np.ndarray, shrink_px: int) -> np.ndarray:
     eroded = cv2.erode(mask255, kernel, iterations=shrink_px)
     return (eroded > 0).astype(np.uint8)
 
-def shrink_mask_by_px(mask01: np.ndarray, shrink_px: int) -> np.ndarray:
-    """
-    Shrink binary mask uniformly by N pixels using cv2.erode.
-    mask01 must be 0/1 uint8.
-    """
-    if shrink_px <= 0:
-        return mask01.copy()
+# def shrink_mask_by_px(mask01: np.ndarray, shrink_px: int) -> np.ndarray:
+#     """
+#     Shrink binary mask uniformly by N pixels using cv2.erode.
+#     mask01 must be 0/1 uint8.
+#     """
+#     if shrink_px <= 0:
+#         return mask01.copy()
 
-    mask255 = (mask01 * 255).astype(np.uint8)
+#     mask255 = (mask01 * 255).astype(np.uint8)
 
-    # Small circular-ish kernel
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+#     # Small circular-ish kernel
+#     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
-    eroded = cv2.erode(mask255, kernel, iterations=shrink_px)
+#     eroded = cv2.erode(mask255, kernel, iterations=shrink_px)
 
-    return (eroded > 0).astype(np.uint8)
+#     return (eroded > 0).astype(np.uint8)
 
 
-def max_feret_diameter_px(mask01: np.ndarray, max_points: int = 600) -> float:
-    """Max Feret via convex hull point-pair max distance (on boundary)."""
-    cnts, _ = cv2.findContours(mask01, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not cnts:
-        return 0.0
-    cnt = max(cnts, key=cv2.contourArea)
-    hull = cv2.convexHull(cnt)
-    pts = hull.reshape(-1, 2).astype(np.float32)
-    if pts.shape[0] == 0:
-        return 0.0
-    if pts.shape[0] > max_points:
-        idx = np.linspace(0, pts.shape[0]-1, max_points).astype(int)
-        pts = pts[idx]
-    diff = pts[:, None, :] - pts[None, :, :]
-    d2 = (diff ** 2).sum(axis=2)
-    return float(np.sqrt(d2.max()))
+# def max_feret_diameter_px(mask01: np.ndarray, max_points: int = 600) -> float:
+#     """Max Feret via convex hull point-pair max distance (on boundary)."""
+#     cnts, _ = cv2.findContours(mask01, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+#     if not cnts:
+#         return 0.0
+#     cnt = max(cnts, key=cv2.contourArea)
+#     hull = cv2.convexHull(cnt)
+#     pts = hull.reshape(-1, 2).astype(np.float32)
+#     if pts.shape[0] == 0:
+#         return 0.0
+#     if pts.shape[0] > max_points:
+#         idx = np.linspace(0, pts.shape[0]-1, max_points).astype(int)
+#         pts = pts[idx]
+#     diff = pts[:, None, :] - pts[None, :, :]
+#     d2 = (diff ** 2).sum(axis=2)
+#     return float(np.sqrt(d2.max()))
 
 def connected_components(mask01: np.ndarray):
     return cv2.connectedComponentsWithStats(mask01, connectivity=8)
@@ -162,21 +162,24 @@ def analyze_image(path: Path):
     illum0 = (r >= ILLUM_RED_MIN).astype(np.uint8)
     illum = largest_connected_component(illum0)
 
+    # Diameter for zoom QC: widest diameter of the (possibly clipped) illumination shape
+    cnts, _ = cv2.findContours(illum.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        cnt = max(cnts, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(cnt)
+        illum_diam = float(max(w, h))
+    else:
+        illum_diam = 0.0
+
     # Smooth + fill holes so leaves don't punch holes in the lit region
     illum = cv2.morphologyEx(
-    illum, cv2.MORPH_CLOSE,
-    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+        illum, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
     )
     illum = fill_holes(illum)
 
+    # Shrink illumination by 150 px
     illum_shrunk = shrink_mask_erode(illum, ILLUM_SHRINK_PX)
-
-
-
-    illum_diam = max_feret_diameter_px(illum)
-
-    # Shrink illumination by 150 px (this is what you described as erode/shrink)
-    illum_shrunk = shrink_mask_by_px(illum, ILLUM_SHRINK_PX)
 
     # 2) Leaf ROIs within shrunk illumination: Red <= 120
     leaf0 = ((r <= LEAF_RED_MAX) & (illum_shrunk > 0)).astype(np.uint8)
@@ -257,7 +260,10 @@ def analyze_image(path: Path):
 
 def main():
     ensure_dirs()
-    imgs = sorted([*RAW_DIR.glob("*.jpg"), *RAW_DIR.glob("*.JPG"), *RAW_DIR.glob("*.jpeg"), *RAW_DIR.glob("*.JPEG")])
+    imgs = sorted({
+    p.resolve() for ext in ("*.jpg", "*.JPG", "*.jpeg", "*.JPEG")
+    for p in RAW_DIR.glob(ext)
+    })
     all_rows = []
 
     for p in imgs:
