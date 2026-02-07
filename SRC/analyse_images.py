@@ -29,6 +29,11 @@ FLUOR_BLUE_MIN = 40
 # Scale adjustment for masks (to reduce processing time)
 ILLUM_SCALE = 0.25   # 0.5 or 0.25; 0.25 is usually much faster
 
+# Scale calibration: diameter of illuminated region in cm
+# Measure the diameter of the full illuminated circle in cm on a ruler image, then set ILLUM_DIAMETER_CM to the true physical diameter in cm. This allows you to convert pixel measurements to real-world units if needed.
+ILLUM_DIAMETER_CM = 18.35  # <-- set this from your ruler image (true physical diameter of the illuminated circle)
+
+
 # Morphology / filtering
 ILLUM_SHRINK_PX = 150  # large shrink to ensure leaf ROIs are well within illumination (tune if needed)
 MIN_LEAF_AREA_PX = 100_000
@@ -180,6 +185,9 @@ def analyse_image(path: Path):
     else:
         illum_diam = 0.0
 
+    # Per-image scale (handles zoom changes)
+    px_per_cm = illum_diam / ILLUM_DIAMETER_CM if ILLUM_DIAMETER_CM > 0 else np.nan
+    cm2_per_px = (1.0 / (px_per_cm ** 2)) if px_per_cm and px_per_cm > 0 else np.nan
 
     # Smooth + fill holes on the small mask
     k_close = max(3, int(round(31 * scale)) | 1)  # odd, >=3
@@ -254,19 +262,28 @@ def analyse_image(path: Path):
 
             coverage = (100.0 * fluor_area / leaf_area) if leaf_area > 0 else 0.0
 
+            leaf_area_cm2 = leaf_area * cm2_per_px if np.isfinite(cm2_per_px) else np.nan
+            fluor_area_cm2 = fluor_area * cm2_per_px if np.isfinite(cm2_per_px) else np.nan
+
+
             # fill fluorescence in red
             vis[fluor_clean > 0] = (0, 0, 255)
 
             rows.append(dict(
                 filename=path.name,
                 illumination_diameter_px=illum_diam,
+                illumination_diameter_cm=ILLUM_DIAMETER_CM,
+                px_per_cm=px_per_cm,
                 total_leaves=total_leaves,
                 leaf_id=i,
                 leaf_area_px=leaf_area,
+                leaf_area_cm2=leaf_area_cm2,
                 fluorescence_area_px=fluor_area,
+                fluorescence_area_cm2=fluor_area_cm2,
                 fluorescence_blob_count=blob_count,
                 leaf_coverage_pct=coverage
             ))
+
 
     # 4/5) overlays: illum outline yellow, leaf outlines green
     # Pre-shrink illumination (cyan)
