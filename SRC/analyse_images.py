@@ -1,241 +1,289 @@
 #!/usr/bin/env python3
-"""
-Leaf segmentation v0 (simple + robust)
-
-Pipeline per image:
-1) Read image
-2) Detect illuminated ROI from Red channel (R > 100)
-   - fill holes to make ROI solid
-   - keep largest component
-   - measure ROI diameter (enclosing circle + equivalent diameter from area)
-3) Segment leaves inside ROI from Red channel (R <= 100)
-   - clean with dilate then erode
-   - connected components + area filter (>= 100,000 px)
-4) Save CSV + QC masks + overlay
-
-Requires: opencv-python, numpy, pandas
-"""
-
 from __future__ import annotations
-
-import argparse
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
-
-import cv2
 import numpy as np
 import pandas as pd
+import cv2
 
+# -----------------------
+# -----------------------
+# CONFIG
+# -----------------------
 
-@dataclass
-class Settings:
-    red_thresh: int = 100                 # illuminated: R > 100; leaves: R <= 100
-    roi_close_kernel: int = 31            # helps join edges + smooth ROI
-    roi_close_iters: int = 2
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-    leaf_min_area_px: int = 100_000       # user-specified for now
-    leaf_morph_kernel: int = 9            # for dilate/erode smoothing
-    leaf_dilate_iters: int = 2
-    leaf_erode_iters: int = 2
+RAW_DIR = BASE_DIR / "DATA" / "raw"
+PROCESSED_DIR = BASE_DIR / "DATA" / "processed"
+OUTPUTS_DIR = BASE_DIR / "DATA" / "outputs"
 
+CSV_OUT = OUTPUTS_DIR / "leaf_fluorescence_results.csv"
 
-def read_image(path: Path) -> np.ndarray:
-    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if img is None:
-        raise FileNotFoundError(f"Could not read image: {path}")
-    return img
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Thresholds (inclusive)
+ILLUM_RED_MIN = 5
+LEAF_RED_MAX = 120
+FLUOR_BLUE_MIN = 35
 
-def fill_holes(binary_255: np.ndarray) -> np.ndarray:
-    """
-    Fill internal holes in a binary mask (uint8 0/255).
-    """
-    h, w = binary_255.shape
-    flood = binary_255.copy()
+# Morphology / filtering
+ILLUM_SHRINK_PX = 150  # large shrink to ensure leaf ROIs are well within illumination (tune if needed)
+MIN_LEAF_AREA_PX = 100_000
+MIN_FLUOR_BLOB_AREA_PX = 50
 
-    # Flood fill from border on inverted mask to find holes
-    inv = cv2.bitwise_not(flood)
-    mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(inv, mask, seedPoint=(0, 0), newVal=255)
+OUT_SUFFIX = "_processed.png"
 
-    # Holes are the parts NOT reached by flood fill (invert back)
-    inv_filled = cv2.bitwise_not(inv)
-    filled = cv2.bitwise_or(binary_255, inv_filled)
-    return filled
+print("analyse_images.py started")
 
+print("BASE_DIR:", BASE_DIR)
+print("RAW_DIR:", RAW_DIR)
+print("PROCESSED_DIR:", PROCESSED_DIR)
+print("CSV_OUT:", CSV_OUT)
 
-def keep_largest_component(binary_255: np.ndarray) -> np.ndarray:
-    """
-    Keep only the largest connected component in a binary image (uint8 0/255).
-    """
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(binary_255, connectivity=8)
-    if num <= 1:
-        return binary_255
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    # component 0 is background
+images = sorted({
+    p.resolve() for ext in ("*.jpg", "*.JPG", "*.jpeg", "*.JPEG")
+    for p in RAW_DIR.glob(ext)
+})
+
+print(f"Found {len(images)} images")
+
+# -----------------------
+# HELPERS
+# -----------------------
+def ensure_dirs():
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+def largest_connected_component(mask01: np.ndarray) -> np.ndarray:
+    """mask01 is 0/1 uint8. Returns 0/1 mask of largest component."""
+    if mask01.max() == 0:
+        return mask01.copy()
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask01, connectivity=8)
+    if n <= 1:
+        return mask01.copy()
     areas = stats[1:, cv2.CC_STAT_AREA]
     idx = 1 + int(np.argmax(areas))
-    out = np.zeros_like(binary_255)
-    out[labels == idx] = 255
-    return out
+    return (labels == idx).astype(np.uint8)
 
-
-def detect_roi_from_red(img_bgr: np.ndarray, s: Settings) -> Tuple[np.ndarray, Tuple[int, int, int], dict]:
+def fill_holes(mask01: np.ndarray) -> np.ndarray:
     """
-    ROI mask from Red channel: illuminated pixels are R > red_thresh.
-    Returns:
-      roi_mask_255, (cx, cy, r), metrics dict
+    Fill internal holes in a binary mask.
+    mask01: uint8 0/1
+    returns: uint8 0/1
     """
-    red = img_bgr[:, :, 2]
+    mask255 = (mask01 * 255).astype(np.uint8)
 
-    roi = np.zeros_like(red, dtype=np.uint8)
-    roi[red > s.red_thresh] = 255
+    h, w = mask255.shape
+    flood = mask255.copy()
+    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
 
-    # Close to smooth and join gaps
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (s.roi_close_kernel, s.roi_close_kernel))
-    roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, k, iterations=s.roi_close_iters)
+    # Flood fill from (0,0) assuming it's background
+    cv2.floodFill(flood, flood_mask, (0, 0), 255)
 
-    # Fill holes (critical because leaves can look "dark" like background)
-    roi = fill_holes(roi)
+    # Invert flood-filled image to get holes, then OR with original
+    holes = cv2.bitwise_not(flood)
+    filled = cv2.bitwise_or(mask255, holes)
 
-    # Keep largest component (handles noise + multiple bright regions)
-    roi = keep_largest_component(roi)
-
-    # Compute circle metrics from contour
-    contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise RuntimeError("No illuminated ROI detected using Red threshold. Try adjusting red_thresh.")
-
-    c = max(contours, key=cv2.contourArea)
-    (cx_f, cy_f), r_f = cv2.minEnclosingCircle(c)
-    cx, cy, r = int(round(cx_f)), int(round(cy_f)), int(round(r_f))
-
-    roi_area_px = int(np.count_nonzero(roi))
-    roi_diameter_px = float(2.0 * r)
-    roi_diameter_eq_px = float(np.sqrt(4.0 * roi_area_px / np.pi))
-
-    metrics = {
-        "roi_area_px": roi_area_px,
-        "roi_radius_px": float(r),
-        "roi_diameter_px": roi_diameter_px,
-        "roi_diameter_eq_px": roi_diameter_eq_px,
-        "roi_cx_px": int(cx),
-        "roi_cy_px": int(cy),
-    }
-
-    return roi, (cx, cy, r), metrics
+    return (filled > 0).astype(np.uint8)
 
 
-def segment_leaves_from_red(img_bgr: np.ndarray, roi_mask_255: np.ndarray, s: Settings) -> Tuple[np.ndarray, int]:
+def shrink_mask_erode(mask01: np.ndarray, shrink_px: int) -> np.ndarray:
     """
-    Leaves: inside ROI, Red <= red_thresh. Returns:
-      leaf_mask_255 (all kept leaves merged), n_leaves_kept
+    Shrink uniformly using cv2.erode with a small elliptical kernel and N iterations.
+    mask01: uint8 0/1
     """
-    red = img_bgr[:, :, 2]
+    if shrink_px <= 0:
+        return mask01.copy()
 
-    leaf = np.zeros_like(red, dtype=np.uint8)
-    leaf[(roi_mask_255 > 0) & (red <= s.red_thresh)] = 255
+    mask255 = (mask01 * 255).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    eroded = cv2.erode(mask255, kernel, iterations=shrink_px)
+    return (eroded > 0).astype(np.uint8)
 
-    # Dilate then erode (ImageJ-ish smoothing)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (s.leaf_morph_kernel, s.leaf_morph_kernel))
-    leaf = cv2.dilate(leaf, k, iterations=s.leaf_dilate_iters)
-    leaf = cv2.erode(leaf, k, iterations=s.leaf_erode_iters)
-
-    # Connected components and area filter
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(leaf, connectivity=8)
-
-    out = np.zeros_like(leaf)
-    kept = 0
-    for i in range(1, num):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if area >= s.leaf_min_area_px:
-            out[labels == i] = 255
-            kept += 1
-
-    return out, kept
-
-
-def make_overlay(img_bgr: np.ndarray, roi_circle: Tuple[int, int, int], roi_mask_255: np.ndarray, leaf_mask_255: np.ndarray) -> np.ndarray:
+def shrink_mask_by_px(mask01: np.ndarray, shrink_px: int) -> np.ndarray:
     """
-    Overlay:
-      - ROI circle in green
-      - ROI edge in light green
-      - leaf edges in white
+    Shrink binary mask uniformly by N pixels using cv2.erode.
+    mask01 must be 0/1 uint8.
     """
+    if shrink_px <= 0:
+        return mask01.copy()
+
+    mask255 = (mask01 * 255).astype(np.uint8)
+
+    # Small circular-ish kernel
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+    eroded = cv2.erode(mask255, kernel, iterations=shrink_px)
+
+    return (eroded > 0).astype(np.uint8)
+
+
+def max_feret_diameter_px(mask01: np.ndarray, max_points: int = 600) -> float:
+    """Max Feret via convex hull point-pair max distance (on boundary)."""
+    cnts, _ = cv2.findContours(mask01, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return 0.0
+    cnt = max(cnts, key=cv2.contourArea)
+    hull = cv2.convexHull(cnt)
+    pts = hull.reshape(-1, 2).astype(np.float32)
+    if pts.shape[0] == 0:
+        return 0.0
+    if pts.shape[0] > max_points:
+        idx = np.linspace(0, pts.shape[0]-1, max_points).astype(int)
+        pts = pts[idx]
+    diff = pts[:, None, :] - pts[None, :, :]
+    d2 = (diff ** 2).sum(axis=2)
+    return float(np.sqrt(d2.max()))
+
+def connected_components(mask01: np.ndarray):
+    return cv2.connectedComponentsWithStats(mask01, connectivity=8)
+
+def draw_contours(img_bgr: np.ndarray, mask01: np.ndarray, color_bgr, thickness: int = 2) -> np.ndarray:
     out = img_bgr.copy()
-    cx, cy, r = roi_circle
-
-    cv2.circle(out, (cx, cy), r, (0, 255, 0), 2)
-
-    # ROI edge
-    roi_edges = cv2.Canny(roi_mask_255, 50, 150)
-    out[roi_edges > 0] = (0, 255, 100)
-
-    # Leaf edges
-    leaf_edges = cv2.Canny(leaf_mask_255, 50, 150)
-    out[leaf_edges > 0] = (255, 255, 255)
-
+    cnts, _ = cv2.findContours(mask01, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        cv2.drawContours(out, cnts, -1, color_bgr, thickness)
     return out
 
+# -----------------------
+# MAIN
+# -----------------------
+def analyze_image(path: Path):
+    img_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise RuntimeError(f"Failed to read {path}")
 
-def process_one(path: Path, out_dir: Path, s: Settings) -> dict:
-    img = read_image(path)
+    b = img_bgr[:, :, 0]
+    r = img_bgr[:, :, 2]
 
-    roi_mask, roi_circle, roi_metrics = detect_roi_from_red(img, s)
-    leaf_mask, n_leaves = segment_leaves_from_red(img, roi_mask, s)
+    # 1) Illumination ROI (UN-ERODED) from Red >= 5
+    illum0 = (r >= ILLUM_RED_MIN).astype(np.uint8)
+    illum = largest_connected_component(illum0)
 
-    qc_masks = out_dir / "QC_masks"
-    qc_overlays = out_dir / "QC_overlays"
-    qc_masks.mkdir(parents=True, exist_ok=True)
-    qc_overlays.mkdir(parents=True, exist_ok=True)
+    # Smooth + fill holes so leaves don't punch holes in the lit region
+    illum = cv2.morphologyEx(
+    illum, cv2.MORPH_CLOSE,
+    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    )
+    illum = fill_holes(illum)
 
-    stem = path.stem
-    cv2.imwrite(str(qc_masks / f"{stem}_roi.png"), roi_mask)
-    cv2.imwrite(str(qc_masks / f"{stem}_leaves.png"), leaf_mask)
-
-    overlay = make_overlay(img, roi_circle, roi_mask, leaf_mask)
-    cv2.imwrite(str(qc_overlays / f"{stem}_overlay.png"), overlay)
-
-    rec = {
-        "image": path.name,
-        "n_leaves_kept": int(n_leaves),
-        **roi_metrics,
-    }
-    return rec
+    illum_shrunk = shrink_mask_erode(illum, ILLUM_SHRINK_PX)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Input folder containing images")
-    ap.add_argument("--output", required=True, help="Output folder")
-    ap.add_argument("--glob", default="*.JPG", help="Glob pattern (default: *.JPG)")
-    args = ap.parse_args()
 
-    in_dir = Path(args.input)
-    out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    illum_diam = max_feret_diameter_px(illum)
 
-    s = Settings()
+    # Shrink illumination by 150 px (this is what you described as erode/shrink)
+    illum_shrunk = shrink_mask_by_px(illum, ILLUM_SHRINK_PX)
 
-    paths = sorted(in_dir.rglob(args.glob))
-    if not paths:
-        raise SystemExit(f"No images found in {in_dir} with glob {args.glob}")
+    # 2) Leaf ROIs within shrunk illumination: Red <= 120
+    leaf0 = ((r <= LEAF_RED_MAX) & (illum_shrunk > 0)).astype(np.uint8)
+
+    # Light cleanup similar to ImageJ open/close (tune if needed)
+    leaf0 = cv2.morphologyEx(leaf0, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    leaf0 = cv2.morphologyEx(leaf0, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+
+    n, labels, stats, _ = connected_components(leaf0)
+    leaf_masks = []
+    for lab in range(1, n):
+        area = int(stats[lab, cv2.CC_STAT_AREA])
+        if area >= MIN_LEAF_AREA_PX:
+            m = (labels == lab).astype(np.uint8)
+            leaf_masks.append((lab, m, area))
+
+    total_leaves = len(leaf_masks)
+
+    # Visual base: Blue channel grayscale -> BGR
+    vis = cv2.cvtColor(b, cv2.COLOR_GRAY2BGR)
 
     rows = []
-    for p in paths:
+    if total_leaves == 0:
+        rows.append(dict(
+            filename=path.name,
+            illumination_diameter_px=illum_diam,
+            total_leaves=0,
+            leaf_id=0,
+            leaf_area_px=0,
+            fluorescence_area_px=0,
+            fluorescence_blob_count=0,
+            leaf_coverage_pct=0.0
+        ))
+    else:
+        for i, (_lab, leaf_m, leaf_area) in enumerate(leaf_masks, start=1):
+            # 3) fluorescence within leaf: Blue >= 35
+            fluor0 = ((b >= FLUOR_BLUE_MIN) & (leaf_m > 0)).astype(np.uint8)
+
+            # filter tiny fluorescence blobs
+            nf, flab, fstats, _ = connected_components(fluor0)
+            fluor_clean = np.zeros_like(fluor0, dtype=np.uint8)
+            blob_count = 0
+            fluor_area = 0
+            for fl in range(1, nf):
+                a = int(fstats[fl, cv2.CC_STAT_AREA])
+                if a >= MIN_FLUOR_BLOB_AREA_PX:
+                    blob_count += 1
+                    fluor_area += a
+                    fluor_clean[flab == fl] = 1
+
+            coverage = (100.0 * fluor_area / leaf_area) if leaf_area > 0 else 0.0
+
+            # fill fluorescence in red
+            vis[fluor_clean > 0] = (0, 0, 255)
+
+            rows.append(dict(
+                filename=path.name,
+                illumination_diameter_px=illum_diam,
+                total_leaves=total_leaves,
+                leaf_id=i,
+                leaf_area_px=leaf_area,
+                fluorescence_area_px=fluor_area,
+                fluorescence_blob_count=blob_count,
+                leaf_coverage_pct=coverage
+            ))
+
+    # 4/5) overlays: illum outline yellow, leaf outlines green
+    # Pre-shrink illumination (cyan)
+    vis = draw_contours(vis, illum, (255, 255, 0), thickness=2)
+
+    # Post-shrink illumination (yellow)
+    vis = draw_contours(vis, illum_shrunk, (0, 255, 255), thickness=3)
+
+    for _lab, leaf_m, _area in leaf_masks:
+        vis = draw_contours(vis, leaf_m, (0, 255, 0), thickness=2)  # green
+
+    return rows, vis
+
+def main():
+    ensure_dirs()
+    imgs = sorted([*RAW_DIR.glob("*.jpg"), *RAW_DIR.glob("*.JPG"), *RAW_DIR.glob("*.jpeg"), *RAW_DIR.glob("*.JPEG")])
+    all_rows = []
+
+    for p in imgs:
         try:
-            rec = process_one(p, out_dir, s)
-            rows.append(rec)
-            print(f"Processed {p.name}: leaves={rec['n_leaves_kept']} roi_d_eq={rec['roi_diameter_eq_px']:.1f}px")
+            rows, vis = analyze_image(p)
+            all_rows.extend(rows)
+            out_img = PROCESSED_DIR / f"{p.stem}{OUT_SUFFIX}"
+            cv2.imwrite(str(out_img), vis)
+            print(f"Processed {p.name} -> {out_img}")
         except Exception as e:
-            print(f"FAILED {p.name}: {e}")
+            all_rows.append(dict(
+                filename=p.name,
+                illumination_diameter_px=float("nan"),
+                total_leaves=0,
+                leaf_id=0,
+                leaf_area_px=0,
+                fluorescence_area_px=0,
+                fluorescence_blob_count=0,
+                leaf_coverage_pct=0.0,
+                error=str(e)
+            ))
+            print(f"ERROR {p.name}: {e}")
 
-    if rows:
-        df = pd.DataFrame(rows)
-        df.to_csv(out_dir / "leaf_results_v0.csv", index=False)
-        print(f"Saved: {out_dir / 'leaf_results_v0.csv'}")
-
+    df = pd.DataFrame(all_rows)
+    df.to_csv(CSV_OUT, index=False)
+    print(f"Wrote {CSV_OUT} ({len(df)} rows)")
 
 if __name__ == "__main__":
     main()
