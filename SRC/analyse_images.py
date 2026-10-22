@@ -80,6 +80,7 @@ DEFAULT_CONFIG: dict = {
         "k_sigma": 4.0,
         "min_delta": 8.0,
         "background_window_px": 61,
+        "envelope_radius_px": 40,
         "absolute_threshold": 60.0,
         "colour_filter": True,
         "green_blue_margin": 0.03,
@@ -392,6 +393,20 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
         bg = cv2.medianBlur(np.clip(small, 0, 255).astype(np.uint8), max(3, min(k, 255)))
         bg = cv2.resize(bg.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
         resid = Bc - bg
+    elif dp["method"] == "envelope":
+        # Rolling-ball style background: morphological opening (erode then
+        # dilate) traces the LOWER envelope of the leaf, so it follows slow
+        # brightness changes but is not lifted by bright deposits smaller than
+        # the structuring element - even when deposits cover much of the leaf.
+        ws = 0.5
+        fill = masked_smooth(Bc, leaf_core.astype(np.float32), 30)
+        tmp = np.where(leaf_core, Bc, fill).astype(np.float32)
+        small = cv2.resize(tmp, None, fx=ws, fy=ws, interpolation=cv2.INTER_AREA)
+        r = max(2, int(round(dp.get("envelope_radius_px", 40) * ws)))
+        bg = cv2.morphologyEx(small, cv2.MORPH_OPEN, disk(r))
+        bg = cv2.GaussianBlur(bg, (0, 0), r / 2.0)
+        bg = cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)
+        resid = Bc - bg
     elif dp["method"] == "absolute":
         resid = Bc - float(dp["absolute_threshold"])
     else:
@@ -405,14 +420,28 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
         core = lm & leaf_core
         if core.sum() == 0:
             continue
+        bg_pix = core
         if dp["method"] == "local":
             sd = robust_sd(resid[core])
             thr = max(dp["k_sigma"] * sd, dp["min_delta"])
             cand = core & (resid >= thr)
+            thr_abs = float(np.median(bg[core])) + thr
+        elif dp["method"] == "envelope":
+            # Noise and offset from the LOWER tail only (P5, P20), assuming the
+            # darkest ~50% of the leaf is clean: robust to dense deposits.
+            p5, p20 = np.percentile(resid[core], [5, 20])
+            sd = max((p20 - p5) / 0.803, 0.5)
+            mu = p20 + 0.842 * sd
+            thr = mu + max(dp["k_sigma"] * sd, dp["min_delta"])
+            cand = core & (resid >= thr)
+            bg_pix = core & (resid < mu)
+            thr_abs = float(np.median(bg[core])) + thr
         else:
             sd, thr = robust_sd(Bc[core]), float(dp["absolute_threshold"])
             cand = core & (resid >= 0)
-        gb_leaf = float(np.median(gb[core]))
+            thr_abs = thr
+        # colour reference from background (non-deposit) pixels of this leaf
+        gb_leaf = float(np.median(gb[bg_pix])) if bg_pix.any() else float(np.median(gb[core]))
         if dp["colour_filter"]:
             cand &= gb >= (gb_leaf + dp["green_blue_margin"])
         vein_px = 0
@@ -464,6 +493,11 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
             "leaf_background_blue": float(np.median(Bc[core])),
             "leaf_noise_sd": sd,
             "threshold_used": thr,
+            # effective threshold as a corrected and as a RAW blue grey level
+            # (raw = what you would read off the original image at this leaf)
+            "threshold_corrected_blue": thr_abs,
+            "threshold_raw_blue_equiv": thr_abs * float(np.median(illum_map[core])),
+            "leaf_raw_blue_median": float(np.median(B[core])),
             "leaf_green_blue": gb_leaf,
             "excess_fluorescence_sum": float(np.clip(resid[dep], 0, None).sum()),
             "mean_illum_factor": float(np.mean(illum_map[core])),

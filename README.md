@@ -82,7 +82,14 @@ Plot (and Tree) as random effects, since leaves and images are sub-samples.
    leaves, and used to correct the blue (tracer) channel. Each image is also
    scaled to a common card level, so thresholds are comparable between images.
 3. **Deposits** (`deposits.method`):
-   * `local` (default) - pixels brighter than the local leaf background by
+   * `envelope` (default) - background is the rolling-ball (morphological
+     opening) lower envelope of the leaf, and noise is estimated from the
+     darkest part of the leaf, so dense or patchy deposits do not raise the
+     threshold. Deposit = background + max(`k_sigma` x noise, `min_delta`)
+     and tracer-coloured. The threshold actually used on each leaf is
+     reported as `threshold_raw_blue_equiv` (raw blue grey level), so it can
+     be compared with what you read off the original image.
+   * `local` - pixels brighter than the local leaf median by
      `k_sigma` robust SDs (and at least `min_delta` grey levels). Needs no
      controls, but will under-estimate very high or continuous (film) cover.
    * `absolute` - corrected blue >= `absolute_threshold`, which should be
@@ -121,9 +128,11 @@ spreadsheet so that Upper and Under surfaces get their own limits.
 
 ## Known limitations
 
-* Coverage counts distinct deposits that are brighter than the surrounding
-  leaf. Faint, diffuse films are only partly captured, so heavily sprayed
-  leaves are likely under-estimated (checked visually on sample images).
+* Deposits larger than ~2x `envelope_radius_px` (40 px, ~7 mm) or covering
+  more than ~50% of a leaf start to be absorbed into the background estimate;
+  very faint films below ~6 corrected grey levels are not detected.
+* The earlier `local` (median) method under-estimated heavily sprayed leaves
+  3-4 fold, because deposits raised the leaf median and noise estimate.
 * Unsprayed background differs ~2-fold between leaf surfaces (higher on the
   underside), so an absolute intensity threshold is not used by default.
 * Deposits on veins are kept (spray collects there); occasional false

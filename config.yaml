@@ -55,6 +55,10 @@ flat_field:
 
 # ---------------------------------------------------------------------
 # Deposit detection
+#   method: envelope - (DEFAULT) background = rolling-ball lower envelope of
+#                      the leaf; noise from the darkest part of the leaf.
+#                      Robust to dense coverage. Threshold = background +
+#                      max(k_sigma x noise, min_delta).
 #   method: local    - deposits = pixels brighter than the local leaf
 #                      background by k robust SDs. Needs no controls,
 #                      but UNDER-estimates very high / continuous cover.
@@ -63,9 +67,11 @@ flat_field:
 #                      control leaves (e.g. their 99.9th percentile).
 # ---------------------------------------------------------------------
 deposits:
-  method: local
-  k_sigma: 4.0             # local: threshold = k x robust SD of residual
-  min_delta: 8.0           # local: and at least this many grey levels
+  method: envelope
+  k_sigma: 3.0             # threshold = k x robust SD of residual
+  min_delta: 6.0           # and at least this many (corrected) grey levels
+  envelope_radius_px: 40     # envelope: rolling-ball radius (px, full res);
+                             # deposits larger than ~2x this merge into background
   background_window_px: 61 # local: median window, >> deposit size
   absolute_threshold: 60.0 # absolute: corrected blue grey level
   colour_filter: true      # require tracer-like colour (see below)
@@ -82,9 +88,9 @@ deposits:
   vein_dilate_px: 3
   detection_limit_by: null       # e.g. Leaf_side, to use a limit per stratum
   detection_limit_values: null   # e.g. {Upper: 0.05, Under: 0.08}
-  detection_limit_pct: 0.05  # from 18 control images (59 leaves), p95 of
-                             # false positives = 0.040% (bootstrap 95% CI
-                             # 0.023-0.055%); rounded up. Re-run
+  detection_limit_pct: 0.05  # from 18 control images (59 leaves), envelope
+                             # method: p95 of false positives = 0.043%
+                             # (bootstrap 95% CI 0.020-0.051%); rounded up. Re-run
                              # calibrate_controls.py when settings change.
   min_deposit_area_px: 5   # remove specks smaller than this (noise)
   leaf_edge_exclusion_px: 6  # ignore a thin rim (edge glare/JPEG halo)
