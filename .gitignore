@@ -16,6 +16,8 @@ DATA/controls_out/**
 DATA/controls_qc/**
 DATA/sprayed_batch1/**
 DATA/sprayed_batch1_qc/**
+DATA/test_zip/**
+DATA/test_zip_qc/**
 DATA/Photo_numbers.xlsx
 # DATA/calibration/ is small and worth tracking with the code
 

@@ -71,6 +71,7 @@ DEFAULT_CONFIG: dict = {
         "saturation_level": 250,
         "min_leaf_area_cm2": 2.0,
         "min_solidity": 0.85,
+        "max_leaf_blue_median": 150,
         "split_erode_px": 25,
     },
     "flat_field": {"enabled": True, "smoothing_sigma_px": 60,
@@ -81,6 +82,12 @@ DEFAULT_CONFIG: dict = {
         "min_delta": 8.0,
         "background_window_px": 61,
         "envelope_radius_px": 40,
+        "absolute_thresholds": {"Upper": 55.0, "Under": 80.0, "default": 80.0},
+        "absolute_colour_margin": 0.04,
+        "colour_model": {"intercept": 0.188, "card_green_red": 0.323, "under": -0.018},
+        "leaf_side_column": "Leaf_side",
+        "leaf_side_aliases": {"Upper": "Upper", "Top": "Upper", "Adaxial": "Upper",
+                              "Under": "Under", "Lower": "Under", "Abaxial": "Under"},
         "absolute_threshold": 60.0,
         "colour_filter": True,
         "green_blue_margin": 0.03,
@@ -97,6 +104,7 @@ DEFAULT_CONFIG: dict = {
         "vein_dilate_px": 3,
     },
     "output": {"overlay_scale": 0.5, "save_debug_images": False},
+    "processing": {"reference_width_px": 2576, "processing_width": None},
     "metadata": {"path": None, "sheet": None, "id_column": "Photo_number",
                  "filename_pattern": r"DSCN0*(\d+)",
                  "summary_factors": ["Spray_rate", "Canopy_location", "Leaf_side"]},
@@ -280,12 +288,24 @@ class ImageResult:
     debug: dict
 
 
-def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageResult:
+def analyse_image(path: Path, cfg: dict, capture: list | None = None,
+                  leaf_side: str | None = None) -> ImageResult:
     """Analyse one image. If `capture` is a list, per-leaf pixel arrays are
     appended to it (used by calibrate_controls.py)."""
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
         raise RuntimeError("could not read image")
+    native_width = img.shape[1]
+    pw = cfg.get("processing", {}).get("processing_width")
+    if pw and img.shape[1] != int(pw):
+        f0 = float(pw) / img.shape[1]
+        img = cv2.resize(img, None, fx=f0, fy=f0, interpolation=cv2.INTER_AREA)
+    # Pixel-based settings are defined at reference_width_px; scale them to
+    # the width actually processed so behaviour is resolution-independent.
+    S = img.shape[1] / float(cfg.get("processing", {}).get("reference_width_px", 2576))
+
+    def P(v):  # scale a length in px
+        return float(v) * S
     f = img.astype(np.float32)
     B, G, R = f[..., 0], f[..., 1], f[..., 2]
     h, w = B.shape
@@ -325,7 +345,7 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
     cm2_per_px = 1.0 / px_per_cm**2 if np.isfinite(px_per_cm) and px_per_cm > 0 else np.nan
 
     card = ((ratio > sg["card_ratio_min"]) & (lit > 0) & ~saturated).astype(np.uint8)
-    card = cv2.morphologyEx(card, cv2.MORPH_OPEN, disk(2))
+    card = cv2.morphologyEx(card, cv2.MORPH_OPEN, disk(max(1, round(P(2)))))
     # Leaves lying across the card (tip to petiole) split the visible red area
     # into several pieces, so keep every large piece, not just the largest.
     n_c, lab_c, st_c, _ = cv2.connectedComponentsWithStats(card, connectivity=8)
@@ -338,28 +358,35 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
     hull = cv2.convexHull(np.vstack(cnts))
     sample_area = np.zeros((h, w), np.uint8)
     cv2.fillPoly(sample_area, [hull], 1)
-    sample_area = erode(sample_area & lit, int(sg["card_edge_margin_px"]))
+    sample_area = erode(sample_area & lit, int(round(P(sg["card_edge_margin_px"]))))
 
     # 3) leaves -----------------------------------------------------------
     leaf = ((ratio < sg["leaf_ratio_max"]) & (sample_area > 0) & ~saturated).astype(np.uint8)
     # Opening removes specks; no closing step, because closing can bridge
     # narrow gaps between neighbouring leaves. Holes are filled per object.
-    leaf = cv2.morphologyEx(leaf, cv2.MORPH_OPEN, disk(2))
+    leaf = cv2.morphologyEx(leaf, cv2.MORPH_OPEN, disk(max(1, round(P(2)))))
     leaf = fill_holes(leaf) & sample_area
     min_leaf_px = (sg["min_leaf_area_cm2"] / cm2_per_px) if np.isfinite(cm2_per_px) else 20000
-    leaf, n_split = split_touching(leaf, int(sg["split_erode_px"]), min_leaf_px * 0.15)
+    leaf, n_split = split_touching(leaf, int(round(P(sg["split_erode_px"]))), min_leaf_px * 0.15)
     if n_split:
         warnings.append(f"{n_split} touching-leaf contact(s) split - check overlay")
     n, lab, st, cen = cv2.connectedComponentsWithStats(leaf, connectivity=4)
     leaf_ids = [i for i in range(1, n) if st[i, cv2.CC_STAT_AREA] >= min_leaf_px]
+    # Reject very bright objects (e.g. the blue fluorescent reference strip):
+    # leaves are dark in blue relative to these.
+    max_b = float(sg.get("max_leaf_blue_median", 150))
+    bright = [i for i in leaf_ids if np.median(B[lab == i]) >= max_b]
+    if bright:
+        warnings.append(f"{len(bright)} very bright object(s) excluded (reference strip?)")
+        leaf_ids = [i for i in leaf_ids if i not in bright]
     # sort top-to-bottom, then left-to-right for stable numbering
     leaf_ids.sort(key=lambda i: (round(cen[i][1] / (h / 6)), cen[i][0]))
     edge_band = (sample_area > 0) & (erode(sample_area, 3) == 0)
 
     # 4) flat field from card fluorescence ---------------------------------
     if ff["enabled"]:
-        card_ref = (card > 0) & (erode(sample_area, 0) > 0) & (cv2.dilate(leaf, disk(8)) == 0)
-        illum_map = masked_smooth(R, card_ref.astype(np.float32), ff["smoothing_sigma_px"])
+        card_ref = (card > 0) & (erode(sample_area, 0) > 0) & (cv2.dilate(leaf, disk(round(P(8)))) == 0)
+        illum_map = masked_smooth(R, card_ref.astype(np.float32), P(ff["smoothing_sigma_px"]))
         card_level = float(np.median(R[card_ref])) if card_ref.any() else np.nan
         # Normalise to a fixed card level so that corrected blue values (and
         # hence thresholds) are comparable between images, despite exposure
@@ -370,14 +397,17 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
         illum_map = np.ones_like(B)
         card_level = float(np.median(R[card > 0]))
     Bc = B / illum_map
+    # Card colour (G/R) tracks camera white balance / black level, and
+    # predicts the colour of clean leaf in this image (hybrid method).
+    card_gr = float(np.median((G[card > 0] + 1.0) / (R[card > 0] + 1.0)))
 
     # 5) deposits ---------------------------------------------------------
     leaf_all = np.isin(lab, leaf_ids)
-    leaf_core = erode(leaf_all.astype(np.uint8), int(dp["leaf_edge_exclusion_px"])) > 0
+    leaf_core = erode(leaf_all.astype(np.uint8), int(round(P(dp["leaf_edge_exclusion_px"])))) > 0
     # Colour (G/B) is evaluated on smoothed channels: JPEG 4:2:0 stores colour
     # at half resolution, so per-pixel colour ratios at sharp edges (midribs,
     # veins) are unreliable and create false 'tracer-coloured' fringes.
-    cs = float(dp.get("colour_blur_sigma", 0.8))
+    cs = P(dp.get("colour_blur_sigma", 0.8))
     Bs = cv2.GaussianBlur(B, (0, 0), cs)
     Gs = cv2.GaussianBlur(G, (0, 0), cs)
     gb = (Gs + 1.0) / (Bs + 1.0)
@@ -388,21 +418,21 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
         fill_val = float(np.median(Bc[leaf_core])) if leaf_core.any() else 0.0
         tmp = np.where(leaf_all, Bc, fill_val).astype(np.float32)
         ws = 0.5
-        k = int(dp["background_window_px"] * ws) | 1
+        k = int(P(dp["background_window_px"]) * ws) | 1
         small = cv2.resize(tmp, None, fx=ws, fy=ws, interpolation=cv2.INTER_AREA)
         bg = cv2.medianBlur(np.clip(small, 0, 255).astype(np.uint8), max(3, min(k, 255)))
         bg = cv2.resize(bg.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
         resid = Bc - bg
-    elif dp["method"] == "envelope":
+    elif dp["method"] in ("envelope", "hybrid"):
         # Rolling-ball style background: morphological opening (erode then
         # dilate) traces the LOWER envelope of the leaf, so it follows slow
         # brightness changes but is not lifted by bright deposits smaller than
         # the structuring element - even when deposits cover much of the leaf.
         ws = 0.5
-        fill = masked_smooth(Bc, leaf_core.astype(np.float32), 30)
+        fill = masked_smooth(Bc, leaf_core.astype(np.float32), P(30))
         tmp = np.where(leaf_core, Bc, fill).astype(np.float32)
         small = cv2.resize(tmp, None, fx=ws, fy=ws, interpolation=cv2.INTER_AREA)
-        r = max(2, int(round(dp.get("envelope_radius_px", 40) * ws)))
+        r = max(2, int(round(P(dp.get("envelope_radius_px", 40)) * ws)))
         bg = cv2.morphologyEx(small, cv2.MORPH_OPEN, disk(r))
         bg = cv2.GaussianBlur(bg, (0, 0), r / 2.0)
         bg = cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -411,6 +441,20 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
         resid = Bc - float(dp["absolute_threshold"])
     else:
         raise ValueError(f"unknown deposits.method '{dp['method']}'")
+
+    # hybrid: per-leaf-side fixed threshold and predicted clean-leaf colour
+    aliases = {str(k).lower(): v for k, v in (dp.get("leaf_side_aliases") or {}).items()}
+    side = aliases.get(str(leaf_side).strip().lower(), leaf_side) if leaf_side is not None else None
+    thr_tab = dp.get("absolute_thresholds") or {}
+    if side in thr_tab:
+        abs_T = float(thr_tab[side])
+    else:
+        abs_T = float(thr_tab.get("default", 80.0))
+        if dp["method"] == "hybrid":
+            warnings.append("leaf side unknown: conservative (Under) fixed threshold used")
+    cm = dp.get("colour_model") or {}
+    gb_pred = (float(cm.get("intercept", 0.188)) + float(cm.get("card_green_red", 0.323)) * card_gr
+               + (float(cm.get("under", -0.018)) if side == "Under" else 0.0))
 
     vis_base = img.copy()
     leaf_rows = []
@@ -426,7 +470,7 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
             thr = max(dp["k_sigma"] * sd, dp["min_delta"])
             cand = core & (resid >= thr)
             thr_abs = float(np.median(bg[core])) + thr
-        elif dp["method"] == "envelope":
+        elif dp["method"] in ("envelope", "hybrid"):
             # Noise and offset from the LOWER tail only (P5, P20), assuming the
             # darkest ~50% of the leaf is clean: robust to dense deposits.
             p5, p20 = np.percentile(resid[core], [5, 20])
@@ -450,14 +494,22 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
             # leaf. Found with a looser threshold (no colour test); candidates
             # touching them are rejected.
             loose = (core & (resid >= dp.get("vein_threshold_fraction", 0.5) * thr)).astype(np.uint8)
-            veins = long_thin_components(loose, dp.get("vein_min_length_px", 60),
+            veins = long_thin_components(loose, P(dp.get("vein_min_length_px", 60)),
                                          dp.get("vein_min_elongation", 4.0))
-            veins = cv2.dilate(veins, disk(int(dp.get("vein_dilate_px", 3)))) > 0
+            veins = cv2.dilate(veins, disk(int(round(P(dp.get("vein_dilate_px", 3)))))) > 0
             vein_px = int((veins & core).sum())
             n_v, lab_v = cv2.connectedComponents(cand.astype(np.uint8), connectivity=8)
             bad = np.unique(lab_v[veins & (lab_v > 0)])
             cand &= ~np.isin(lab_v, bad)
-        dep, n_dep, dep_areas = remove_small(cand, int(dp["min_deposit_area_px"]))
+        fixed = np.zeros_like(cand)
+        if dp["method"] == "hybrid":
+            # Control-referenced test: exposure-corrected blue above the level
+            # never reached by unsprayed leaves of this leaf side, AND colour
+            # above the clean-leaf colour predicted from the card. Detects
+            # films covering most of a leaf, which leaf-relative tests cannot.
+            fixed = core & (Bc >= abs_T) & ((gb - gb_pred) >= float(dp.get("absolute_colour_margin", 0.04)))
+            cand = cand | fixed
+        dep, n_dep, dep_areas = remove_small(cand, int(round(dp["min_deposit_area_px"] * S * S)))
         dep = dep.astype(bool)
         deposit_all |= dep
         if capture is not None:
@@ -465,6 +517,7 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
                             "z": (resid[core] / max(sd, 1e-6)).astype(np.float32),
                             "delta": resid[core].astype(np.float32),
                             "dgb": (gb[core] - gb_leaf).astype(np.float32),
+                            "gb": gb[core].astype(np.float32),
                             "bc": Bc[core].astype(np.float32)})
 
         leaf_px = int(lm.sum())
@@ -493,6 +546,10 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
             "leaf_background_blue": float(np.median(Bc[core])),
             "leaf_noise_sd": sd,
             "threshold_used": thr,
+            "coverage_fixed_pct": 100.0 * float((dep & fixed).sum()) / core_px if core_px else 0.0,
+            "leaf_side_used": side,
+            "fixed_threshold_corrected_blue": abs_T if dp["method"] == "hybrid" else np.nan,
+            "predicted_clean_green_blue": gb_pred,
             # effective threshold as a corrected and as a RAW blue grey level
             # (raw = what you would read off the original image at this leaf)
             "threshold_corrected_blue": thr_abs,
@@ -526,6 +583,8 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
         "px_per_cm": px_per_cm,
         "scale_method": sc["method"],
         "card_height_px": card_height_px,
+        "native_width_px": native_width,
+        "processed_width_px": img.shape[1],
         "illumination_diameter_px": illum_diam_px,
         "total_leaf_area_cm2": sum(r["leaf_area_cm2"] for r in leaf_rows),
         "pooled_coverage_pct": 100.0 * tot_dep / tot_core if tot_core else np.nan,
@@ -534,6 +593,7 @@ def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageRe
         "total_deposit_count": sum(r["deposit_count"] for r in leaf_rows),
         "leaf_raw_blue_median": blue_med,
         "card_red_median": card_level,
+        "card_green_red": card_gr,
         "leaf_saturated_fraction": frac_sat,
         "deposit_method": dp["method"],
         "warnings": "; ".join(warnings),
@@ -629,10 +689,27 @@ def main(argv=None) -> int:
         log.error("No images found. Supported extensions: %s", ", ".join(sorted(IMAGE_EXTS)))
         return 1
 
+    md = cfg.get("metadata", {})
+    meta_path = args.metadata or (resolve(md["path"]) if md.get("path") else None)
+    meta, side_of = None, {}
+    if meta_path:
+        import metadata as M
+        pattern = md.get("filename_pattern", r"DSCN0*(\d+)")
+        idc = md.get("id_column", "Photo_number")
+        meta = M.load_metadata(meta_path, args.sheet or md.get("sheet"), idc)
+        log.info("Metadata: %s (%d rows)", meta_path, len(meta))
+        sc_ = cfg["deposits"].get("leaf_side_column", "Leaf_side")
+        if sc_ in meta.columns:
+            side_of = dict(zip(meta[idc], meta[sc_]))
+    elif cfg["deposits"]["method"] == "hybrid":
+        log.warning("No metadata: leaf side unknown, so the conservative (Under) fixed threshold is used. "
+                    "Give --metadata for full sensitivity on upper surfaces.")
+
     leaf_rows, summaries = [], []
     for i, p in enumerate(images, 1):
         try:
-            res = analyse_image(p, cfg)
+            side = side_of.get(M.photo_number(p.name, pattern)) if side_of else None
+            res = analyse_image(p, cfg, leaf_side=side)
             leaf_rows.extend(res.leaf_rows)
             summaries.append(res.summary)
             cv2.imwrite(str(proc_dir / f"{p.stem}_qc.jpg"), res.overlay, [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -646,14 +723,7 @@ def main(argv=None) -> int:
             summaries.append({"filename": p.name, "n_leaves": 0, "warnings": f"ERROR: {e}"})
 
     leaf_df, img_df = pd.DataFrame(leaf_rows), pd.DataFrame(summaries)
-    md = cfg.get("metadata", {})
-    meta_path = args.metadata or (resolve(md["path"]) if md.get("path") else None)
     if meta_path:
-        import metadata as M
-        pattern = md.get("filename_pattern", r"DSCN0*(\d+)")
-        idc = md.get("id_column", "Photo_number")
-        meta = M.load_metadata(meta_path, args.sheet or md.get("sheet"), idc)
-        log.info("Metadata: %s (%d rows)", meta_path, len(meta))
         issues = M.check_metadata(meta, [p.name for p in images], pattern, idc)
         issues.to_csv(out_dir / "metadata_issues.csv", index=False)
         leaf_df = M.attach(leaf_df, meta, pattern, idc)

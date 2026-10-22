@@ -40,6 +40,8 @@ segmentation:
   saturation_level: 250    # pixels with any channel >= this are excluded
   min_leaf_area_cm2: 2.0   # reject smaller objects (debris, LEDs)
   min_solidity: 0.85       # warn if a leaf outline is irregular (overlap)
+  max_leaf_blue_median: 150  # objects brighter than this in raw blue are not
+                             # leaves (e.g. the blue fluorescent reference strip)
   split_erode_px: 25       # separate touching leaves (0 = off). Better:
                            # lay leaves out so they do not touch.
 
@@ -55,7 +57,14 @@ flat_field:
 
 # ---------------------------------------------------------------------
 # Deposit detection
-#   method: envelope - (DEFAULT) background = rolling-ball lower envelope of
+#   method: hybrid   - (DEFAULT) envelope test (below) OR a fixed,
+#                      control-referenced test: corrected blue >=
+#                      absolute_thresholds[leaf side] AND colour (G/B) at least
+#                      absolute_colour_margin above the clean-leaf colour
+#                      predicted from the card (colour_model). Detects films
+#                      covering most of a leaf. Leaf side comes from the
+#                      metadata (Leaf_side); unknown -> 'default' (Under).
+#   method: envelope - background = rolling-ball lower envelope of
 #                      the leaf; noise from the darkest part of the leaf.
 #                      Robust to dense coverage. Threshold = background +
 #                      max(k_sigma x noise, min_delta).
@@ -67,9 +76,20 @@ flat_field:
 #                      control leaves (e.g. their 99.9th percentile).
 # ---------------------------------------------------------------------
 deposits:
-  method: envelope
+  method: hybrid
   k_sigma: 3.0             # threshold = k x robust SD of residual
   min_delta: 6.0           # and at least this many (corrected) grey levels
+  absolute_thresholds:       # corrected blue (card = 100); from 18 control
+    Upper: 55.0              # images: false positives p95 <= 0.004% per leaf
+    Under: 80.0              # (leave-one-image-out), max 0.016%
+    default: 80.0            # used when leaf side is unknown (conservative)
+  absolute_colour_margin: 0.04
+  colour_model:              # clean-leaf G/B = intercept + card_green_red x
+    intercept: 0.188         #   (card G/R) + under (if Under). Fitted on
+    card_green_red: 0.323    #   controls; corrects auto white balance and
+    under: -0.018            #   black-level effects.
+  leaf_side_column: Leaf_side
+  leaf_side_aliases: {Upper: Upper, Top: Upper, Adaxial: Upper, Under: Under, Lower: Under, Abaxial: Under}
   envelope_radius_px: 40     # envelope: rolling-ball radius (px, full res);
                              # deposits larger than ~2x this merge into background
   background_window_px: 61 # local: median window, >> deposit size
@@ -94,6 +114,16 @@ deposits:
                              # calibrate_controls.py when settings change.
   min_deposit_area_px: 5   # remove specks smaller than this (noise)
   leaf_edge_exclusion_px: 6  # ignore a thin rim (edge glare/JPEG halo)
+
+# ---------------------------------------------------------------------
+# Resolution. All *_px settings are defined for images 2576 px wide (~57
+# px/cm on the A4 card) and are scaled automatically for other widths.
+# processing_width resamples every image to a fixed width first, so that
+# results are comparable with a calibration done at that width.
+# ---------------------------------------------------------------------
+processing:
+  reference_width_px: 2576
+  processing_width: null     # null = analyse at native resolution
 
 output:
   overlay_scale: 0.5       # size of QC images relative to the original

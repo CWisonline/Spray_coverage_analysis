@@ -82,7 +82,17 @@ Plot (and Tree) as random effects, since leaves and images are sub-samples.
    leaves, and used to correct the blue (tracer) channel. Each image is also
    scaled to a common card level, so thresholds are comparable between images.
 3. **Deposits** (`deposits.method`):
-   * `envelope` (default) - background is the rolling-ball (morphological
+   * `hybrid` (default) - a pixel is deposit if EITHER the envelope test
+     below OR a fixed, control-referenced test is met. The fixed test
+     requires exposure-corrected blue >= `absolute_thresholds` for that leaf
+     side (Upper 55, Under 80; card = 100) AND green/blue at least
+     `absolute_colour_margin` (0.04) above the clean-leaf colour predicted
+     from the card's colour (`colour_model`, corrects auto white balance).
+     This captures tracer films covering most of a leaf, which no
+     leaf-relative test can detect. Leaf side is read from the metadata
+     (`Leaf_side`); without metadata the conservative Under threshold is
+     used for every leaf. `coverage_fixed_pct` reports the fixed-test part.
+   * `envelope` - background is the rolling-ball (morphological
      opening) lower envelope of the leaf, and noise is estimated from the
      darkest part of the leaf, so dense or patchy deposits do not raise the
      threshold. Deposit = background + max(`k_sigma` x noise, `min_delta`)
@@ -126,6 +136,15 @@ NOTE: this was derived from re-compressed copies of the photos (uploaded
 via chat, ~150 kB each). Re-run on the camera originals, ideally with the
 spreadsheet so that Upper and Under surfaces get their own limits.
 
+## Validation (Oct 2026)
+
+* 18 unsprayed control images (59 leaves): hybrid false-positive coverage per
+  leaf median 0.000%, p95 0.045% (bootstrap 95% CI 0.019-0.050%), max 0.056%.
+  Fixed thresholds: leave-one-image-out p95 <= 0.004%.
+* DSCN0967 (Full, Upper): leaf 1 coated with tracer film -> 59.9% (envelope
+  only: 7.5%; previous median method: ~1%).
+* Pre-spray originals DSCN0907/0909: 0.00% on all leaves.
+
 ## Known limitations
 
 * Deposits larger than ~2x `envelope_radius_px` (40 px, ~7 mm) or covering
@@ -134,7 +153,12 @@ spreadsheet so that Upper and Under surfaces get their own limits.
 * The earlier `local` (median) method under-estimated heavily sprayed leaves
   3-4 fold, because deposits raised the leaf median and noise estimate.
 * Unsprayed background differs ~2-fold between leaf surfaces (higher on the
-  underside), so an absolute intensity threshold is not used by default.
+  underside), hence separate fixed thresholds per leaf side.
+* Blue-fluorescing features that are not tracer-coloured (G/B like clean
+  leaf) are not counted, e.g. a light-blue streak on DSCN0967 leaf 2.
+* Images are 4608 x 3456 originals (~103 px/cm). All *_px settings scale
+  automatically from the 2576-px reference.
+* Camera white balance was on auto; set a fixed preset for future imaging.
 * Deposits on veins are kept (spray collects there); occasional false
   positives along midribs remain and are covered by the detection limit.
 

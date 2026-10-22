@@ -113,6 +113,9 @@ def main(argv=None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     images = sorted(p for p in in_dir.iterdir() if p.suffix.lower() in A.IMAGE_EXTS)
     meta = None
+    if cfg["deposits"]["method"] == "hybrid" and not args.metadata:
+        log.warning("hybrid method without --metadata: leaf side unknown, the Under (conservative) fixed "
+                    "threshold is applied to all leaves, so Upper-surface false positives are not tested.")
     if args.metadata:
         md = cfg.get("metadata", {})
         pattern, idc = md.get("filename_pattern", r"DSCN0*(\d+)"), md.get("id_column", "Photo_number")
@@ -131,7 +134,13 @@ def main(argv=None) -> int:
     for i, p in enumerate(images, 1):
         cap: list = []
         try:
-            res = A.analyse_image(p, cfg, capture=cap)
+            side = None
+            if meta is not None:
+                sc_ = cfg["deposits"].get("leaf_side_column", "Leaf_side")
+                row = meta.loc[meta[idc] == M.photo_number(p.name, pattern)]
+                if sc_ in meta.columns and len(row):
+                    side = row[sc_].iloc[0]
+            res = A.analyse_image(p, cfg, capture=cap, leaf_side=side)
         except Exception as e:
             log.error("[%d/%d] %s: ERROR %s", i, len(images), p.name, e)
             continue
