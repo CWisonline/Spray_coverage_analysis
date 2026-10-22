@@ -1,3 +1,106 @@
-# Set Scale
-px_mm = distance=150, known=10, unit=mm
+# =====================================================================
+# Leaf spray coverage analysis - configuration
+# All paths are relative to the repository root unless absolute.
+# Command-line options (see `python SRC/analyse_images.py --help`)
+# override the paths given here.
+# =====================================================================
 
+paths:
+  raw_dir: DATA/raw              # input images (.jpg/.jpeg/.png/.tif/.tiff)
+  processed_dir: DATA/processed  # QC overlay images
+  outputs_dir: DATA/outputs      # CSV results
+
+# ---------------------------------------------------------------------
+# Spatial scale (pixels -> cm). Choose ONE method.
+#   fixed               : use px_per_cm (from a ruler image taken at the
+#                         same camera height/zoom as the samples)
+#   card_height         : px_per_cm = measured card height (px) / card_height_cm.
+#                         Recommended: the card is in the sample plane, so
+#                         the scale is checked in every image.
+#   illumination_circle : NOT recommended. The lit circle is set by the lens/
+#                         filter optics, not the sample plane: in the control
+#                         set its diameter varied ~30% while the card size
+#                         varied <3%.
+# ---------------------------------------------------------------------
+scale:
+  method: card_height
+  card_height_cm: 21.0           # A4 card (21.0 x 29.7 cm), long side horizontal.
+                                 # Verified: card aspect ratio in images = 1.41-1.42.
+  px_per_cm: 96.5                # used when method = fixed
+  illum_diameter_cm: 18.35       # used when method = illumination_circle
+  illum_min_sum: 15              # B+G+R threshold defining the lit circle
+
+# ---------------------------------------------------------------------
+# Segmentation (colour ratios are insensitive to vignetting/exposure)
+# ---------------------------------------------------------------------
+segmentation:
+  card_ratio_min: 1.0      # R/B above this = red background card
+  leaf_ratio_max: 0.6      # R/B below this (inside card) = leaf
+  card_edge_margin_px: 15  # shrink the card region to avoid its edge
+  saturation_level: 250    # pixels with any channel >= this are excluded
+  min_leaf_area_cm2: 2.0   # reject smaller objects (debris, LEDs)
+  min_solidity: 0.85       # warn if a leaf outline is irregular (overlap)
+  split_erode_px: 25       # separate touching leaves (0 = off). Better:
+                           # lay leaves out so they do not touch.
+
+# ---------------------------------------------------------------------
+# Flat-field correction: the red card's own fluorescence is used as a
+# map of UV excitation/vignetting, interpolated under the leaves.
+# ---------------------------------------------------------------------
+flat_field:
+  enabled: true
+  smoothing_sigma_px: 60   # Gaussian sigma at full resolution
+  normalise_between_images: true  # scale every image to the same card level
+  card_reference_level: 100.0     # card red level that images are scaled to
+
+# ---------------------------------------------------------------------
+# Deposit detection
+#   method: local    - deposits = pixels brighter than the local leaf
+#                      background by k robust SDs. Needs no controls,
+#                      but UNDER-estimates very high / continuous cover.
+#   method: absolute - deposits = flat-field corrected blue >=
+#                      absolute_threshold. Calibrate from untreated
+#                      control leaves (e.g. their 99.9th percentile).
+# ---------------------------------------------------------------------
+deposits:
+  method: local
+  k_sigma: 4.0             # local: threshold = k x robust SD of residual
+  min_delta: 8.0           # local: and at least this many grey levels
+  background_window_px: 61 # local: median window, >> deposit size
+  absolute_threshold: 60.0 # absolute: corrected blue grey level
+  colour_filter: true      # require tracer-like colour (see below)
+  green_blue_margin: 0.03  # deposit G/B must exceed leaf median G/B + this
+  colour_blur_sigma: 2.5   # smooth G and B before the colour test (JPEG 4:2:0
+                           # stores colour at half resolution; avoids false
+                           # 'tracer-coloured' fringes along veins)
+  vein_filter: false       # reject detections on long thin bright structures
+                           # (veins, creases). Reduces false positives but ALSO
+                           # removes genuine deposits along the midrib.
+  vein_threshold_fraction: 0.5
+  vein_min_length_px: 60
+  vein_min_elongation: 4.0
+  vein_dilate_px: 3
+  detection_limit_by: null       # e.g. Leaf_side, to use a limit per stratum
+  detection_limit_values: null   # e.g. {Upper: 0.05, Under: 0.08}
+  detection_limit_pct: 0.05  # from 18 control images (59 leaves), p95 of
+                             # false positives = 0.040% (bootstrap 95% CI
+                             # 0.023-0.055%); rounded up. Re-run
+                             # calibrate_controls.py when settings change.
+  min_deposit_area_px: 5   # remove specks smaller than this (noise)
+  leaf_edge_exclusion_px: 6  # ignore a thin rim (edge glare/JPEG halo)
+
+output:
+  overlay_scale: 0.5       # size of QC images relative to the original
+  save_debug_images: false # also save flat-field and residual maps
+
+# ---------------------------------------------------------------------
+# Trial metadata (optional). Images are matched by camera file number:
+# DSCN0923.JPG -> Photo_number 923. Can also be given on the command line:
+#   python SRC/analyse_images.py --metadata Photo_numbers.xlsx --sheet Cherry
+# ---------------------------------------------------------------------
+metadata:
+  path: null                       # e.g. DATA/Photo_numbers.xlsx
+  sheet: null                      # e.g. Cherry
+  id_column: Photo_number
+  filename_pattern: 'DSCN0*(\d+)'
+  summary_factors: [Spray_rate, Canopy_location, Leaf_side]

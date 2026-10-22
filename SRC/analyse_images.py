@@ -1,356 +1,653 @@
 #!/usr/bin/env python3
+"""
+Leaf spray coverage analysis from UV-fluorescence images.
+
+Pipeline (per image)
+--------------------
+1. Lit region      : the illuminated circle (B+G+R above a low threshold).
+2. Background card : red-fluorescing card, found by R/B ratio > card_ratio_min.
+                     Its convex hull defines the sample area.
+3. Leaves          : objects inside the card hull with R/B < leaf_ratio_max.
+                     Ratios are used instead of absolute levels because they
+                     are largely unaffected by vignetting and exposure.
+4. Flat field      : the card's red fluorescence is smoothed and interpolated
+                     under the leaves to give a relative UV-excitation map;
+                     the blue (tracer) channel is divided by it.
+5. Deposits        : 'local'    - pixels exceeding the local leaf background
+                                  by k robust SDs (no controls needed), or
+                     'absolute' - corrected blue >= a threshold calibrated on
+                                  untreated control leaves.
+                     Optionally require a tracer-like colour (higher G/B than
+                     the leaf), which rejects bright midribs.
+6. Outputs         : per-leaf CSV, per-image summary CSV, QC overlay images.
+
+Run from anywhere:
+    python SRC/analyse_images.py
+    python SRC/analyse_images.py --input "D:/trial/images" --config config.yaml
+"""
 from __future__ import annotations
+
+import argparse
+import copy
+import logging
+import sys
+from dataclasses import dataclass
 from pathlib import Path
+
+import cv2
 import numpy as np
 import pandas as pd
-import cv2
 
-# -----------------------
-# -----------------------
-# CONFIG
-# -----------------------
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
-RAW_DIR = BASE_DIR / "DATA" / "raw"
-PROCESSED_DIR = BASE_DIR / "DATA" / "processed"
-OUTPUTS_DIR = BASE_DIR / "DATA" / "outputs"
+log = logging.getLogger("spray_coverage")
 
-CSV_OUT = OUTPUTS_DIR / "leaf_fluorescence_results.csv"
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+DEFAULT_CONFIG: dict = {
+    "paths": {
+        "raw_dir": "DATA/raw",
+        "processed_dir": "DATA/processed",
+        "outputs_dir": "DATA/outputs",
+    },
+    "scale": {
+        "method": "card_height",
+        "card_height_cm": 21.0,
+        "px_per_cm": 96.5,
+        "illum_diameter_cm": 18.35,
+        "illum_min_sum": 15,
+    },
+    "segmentation": {
+        "card_ratio_min": 1.0,
+        "leaf_ratio_max": 0.6,
+        "card_edge_margin_px": 15,
+        "saturation_level": 250,
+        "min_leaf_area_cm2": 2.0,
+        "min_solidity": 0.85,
+        "split_erode_px": 25,
+    },
+    "flat_field": {"enabled": True, "smoothing_sigma_px": 60,
+                   "normalise_between_images": True, "card_reference_level": 100.0},
+    "deposits": {
+        "method": "local",
+        "k_sigma": 4.0,
+        "min_delta": 8.0,
+        "background_window_px": 61,
+        "absolute_threshold": 60.0,
+        "colour_filter": True,
+        "green_blue_margin": 0.03,
+        "detection_limit_pct": None,
+        "detection_limit_by": None,
+        "detection_limit_values": None,
+        "min_deposit_area_px": 5,
+        "leaf_edge_exclusion_px": 6,
+        "colour_blur_sigma": 2.5,
+        "vein_filter": False,
+        "vein_threshold_fraction": 0.5,
+        "vein_min_length_px": 60,
+        "vein_min_elongation": 4.0,
+        "vein_dilate_px": 3,
+    },
+    "output": {"overlay_scale": 0.5, "save_debug_images": False},
+    "metadata": {"path": None, "sheet": None, "id_column": "Photo_number",
+                 "filename_pattern": r"DSCN0*(\d+)",
+                 "summary_factors": ["Spray_rate", "Canopy_location", "Leaf_side"]},
+}
 
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Thresholds (inclusive)
-ILLUM_RED_MIN = 5
-LEAF_RED_MAX = 120
-FLUOR_BLUE_MIN = 50
-
-# Scale adjustment for masks (to reduce processing time)
-ILLUM_SCALE = 0.25   # 0.5 or 0.25; 0.25 is usually much faster
-
-# Scale calibration: diameter of illuminated region in cm
-# Measure the diameter of the full illuminated circle in cm on a ruler image, then set ILLUM_DIAMETER_CM to the true physical diameter in cm. This allows you to convert pixel measurements to real-world units if needed.
-ILLUM_DIAMETER_CM = 18.35  # <-- set this from your ruler image (true physical diameter of the illuminated circle)
+def _deep_update(base: dict, new: dict) -> dict:
+    for k, v in (new or {}).items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_update(base[k], v)
+        else:
+            base[k] = v
+    return base
 
 
-# Morphology / filtering
-ILLUM_SHRINK_PX = 150  # large shrink to ensure leaf ROIs are well within illumination (tune if needed)
-MIN_LEAF_AREA_PX = 100_000
-MIN_FLUOR_BLOB_AREA_PX = 20
+def load_config(path: Path | None) -> dict:
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    if path is None:
+        return cfg
+    if not path.exists():
+        log.warning("Config file %s not found - using defaults.", path)
+        return cfg
+    if yaml is None:
+        sys.exit("PyYAML is required to read config.yaml: pip install pyyaml")
+    with open(path, "r", encoding="utf-8") as fh:
+        user = yaml.safe_load(fh) or {}
+    if not isinstance(user, dict):
+        sys.exit(f"{path} is not a valid YAML mapping.")
+    return _deep_update(cfg, user)
 
-OUT_SUFFIX = "_processed.png"
 
-print("analyse_images.py started")
+def resolve(p: str | Path) -> Path:
+    p = Path(p).expanduser()
+    return p if p.is_absolute() else (REPO_ROOT / p)
 
-print("BASE_DIR:", BASE_DIR)
-print("RAW_DIR:", RAW_DIR)
-print("PROCESSED_DIR:", PROCESSED_DIR)
-print("CSV_OUT:", CSV_OUT)
 
-RAW_DIR.mkdir(parents=True, exist_ok=True)
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-
-images = sorted({
-    p.resolve() for ext in ("*.jpg", "*.JPG", "*.jpeg", "*.JPEG")
-    for p in RAW_DIR.glob(ext)
-})
-
-print(f"Found {len(images)} images")
-
-# -----------------------
-# HELPERS
-# -----------------------
-def ensure_dirs():
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-
-def largest_connected_component(mask01: np.ndarray) -> np.ndarray:
-    """mask01 is 0/1 uint8. Returns 0/1 mask of largest component."""
-    if mask01.max() == 0:
-        return mask01.copy()
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask01, connectivity=8)
+# ---------------------------------------------------------------------------
+# Mask helpers
+# ---------------------------------------------------------------------------
+def largest_component(mask: np.ndarray) -> np.ndarray:
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
     if n <= 1:
-        return mask01.copy()
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    idx = 1 + int(np.argmax(areas))
-    return (labels == idx).astype(np.uint8)
-
-def fill_holes(mask01: np.ndarray) -> np.ndarray:
-    """
-    Fill internal holes in a binary mask.
-    mask01: uint8 0/1
-    returns: uint8 0/1
-    """
-    mask255 = (mask01 * 255).astype(np.uint8)
-
-    h, w = mask255.shape
-    flood = mask255.copy()
-    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
-
-    # Flood fill from (0,0) assuming it's background
-    cv2.floodFill(flood, flood_mask, (0, 0), 255)
-
-    # Invert flood-filled image to get holes, then OR with original
-    holes = cv2.bitwise_not(flood)
-    filled = cv2.bitwise_or(mask255, holes)
-
-    return (filled > 0).astype(np.uint8)
+        return np.zeros_like(mask, dtype=np.uint8)
+    idx = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+    return (lab == idx).astype(np.uint8)
 
 
-def shrink_mask_erode(mask01: np.ndarray, shrink_px: int) -> np.ndarray:
-    """
-    Shrink uniformly using cv2.erode with a small elliptical kernel and N iterations.
-    mask01: uint8 0/1
-    """
-    if shrink_px <= 0:
-        return mask01.copy()
-
-    mask255 = (mask01 * 255).astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    eroded = cv2.erode(mask255, kernel, iterations=shrink_px)
-    return (eroded > 0).astype(np.uint8)
-
-# def shrink_mask_by_px(mask01: np.ndarray, shrink_px: int) -> np.ndarray:
-#     """
-#     Shrink binary mask uniformly by N pixels using cv2.erode.
-#     mask01 must be 0/1 uint8.
-#     """
-#     if shrink_px <= 0:
-#         return mask01.copy()
-
-#     mask255 = (mask01 * 255).astype(np.uint8)
-
-#     # Small circular-ish kernel
-#     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-
-#     eroded = cv2.erode(mask255, kernel, iterations=shrink_px)
-
-#     return (eroded > 0).astype(np.uint8)
-
-
-# def max_feret_diameter_px(mask01: np.ndarray, max_points: int = 600) -> float:
-#     """Max Feret via convex hull point-pair max distance (on boundary)."""
-#     cnts, _ = cv2.findContours(mask01, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-#     if not cnts:
-#         return 0.0
-#     cnt = max(cnts, key=cv2.contourArea)
-#     hull = cv2.convexHull(cnt)
-#     pts = hull.reshape(-1, 2).astype(np.float32)
-#     if pts.shape[0] == 0:
-#         return 0.0
-#     if pts.shape[0] > max_points:
-#         idx = np.linspace(0, pts.shape[0]-1, max_points).astype(int)
-#         pts = pts[idx]
-#     diff = pts[:, None, :] - pts[None, :, :]
-#     d2 = (diff ** 2).sum(axis=2)
-#     return float(np.sqrt(d2.max()))
-
-def connected_components(mask01: np.ndarray):
-    return cv2.connectedComponentsWithStats(mask01, connectivity=8)
-
-def draw_contours(img_bgr: np.ndarray, mask01: np.ndarray, color_bgr, thickness: int = 2) -> np.ndarray:
-    out = img_bgr.copy()
-    cnts, _ = cv2.findContours(mask01, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if cnts:
-        cv2.drawContours(out, cnts, -1, color_bgr, thickness)
+def fill_holes(mask: np.ndarray) -> np.ndarray:
+    """Fill internal holes of every object in a 0/1 mask."""
+    cnts, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    out = np.zeros_like(mask, dtype=np.uint8)
+    cv2.drawContours(out, cnts, -1, 1, thickness=cv2.FILLED)
     return out
 
-def mask_centroid_xy(mask01: np.ndarray) -> tuple[int, int] | None:
-    """
-    Centroid of a binary mask (0/1). Returns (x, y) in pixel coords, or None if empty.
-    """
-    m = mask01.astype(np.uint8)
-    M = cv2.moments(m, binaryImage=True)
-    if M["m00"] == 0:
-        return None
-    cx = int(M["m10"] / M["m00"])
-    cy = int(M["m01"] / M["m00"])
-    return cx, cy
 
-# -----------------------
-# MAIN
-# -----------------------
-def analyse_image(path: Path):
-    img_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        raise RuntimeError(f"Failed to read {path}")
+def disk(r: int) -> np.ndarray:
+    r = max(1, int(r))
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
 
-    b = img_bgr[:, :, 0]
-    r = img_bgr[:, :, 2]
 
-    # 1) Illumination ROI (UN-ERODED) from Red >= 5
-    # --- Illumination mask at reduced scale (for speed) ---
-    h, w = r.shape[:2]
-    scale = float(ILLUM_SCALE)
+def erode(mask: np.ndarray, r: int) -> np.ndarray:
+    if r <= 0:
+        return mask.astype(np.uint8)
+    # Distance transform gives an exact circular erosion of any radius.
+    dist = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
+    return (dist > r).astype(np.uint8)
 
-    r_small = cv2.resize(r, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
-    illum0_small = (r_small >= ILLUM_RED_MIN).astype(np.uint8)
-    illum_small = largest_connected_component(illum0_small)
+def remove_small(mask: np.ndarray, min_area: int):
+    """Remove components < min_area. Returns cleaned mask, n kept, areas, labels."""
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    areas = st[1:, cv2.CC_STAT_AREA]
+    keep = np.zeros(n, dtype=bool)
+    keep[1:] = areas >= min_area
+    return keep[lab].astype(np.uint8), int(keep.sum()), areas[keep[1:]]
 
-    # Diameter for zoom QC on the UN-SHRUNK mask (computed on small mask, scaled to full-res px)
-    cnts, _ = cv2.findContours(illum_small.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+def split_touching(mask: np.ndarray, erode_px: int, min_seed_area: float):
+    """Separate leaves that touch at narrow contacts. Each object is eroded;
+    if it breaks into >= 2 sizeable cores, pixels are reassigned to the cores
+    by watershed and a 1-px cut line is drawn between them.
+    Returns (new mask, number of extra objects created)."""
+    if erode_px <= 0:
+        return mask, 0
+    core = erode(mask, erode_px)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+    seeds = np.zeros(mask.shape, np.int32)
+    k = 0
+    for i in range(1, n):
+        if st[i, cv2.CC_STAT_AREA] >= min_seed_area:
+            k += 1
+            seeds[lab == i] = k + 1          # labels >= 2; 1 = background
+    n_obj, _ = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
+    extra = k - (n_obj - 1)
+    if extra <= 0:
+        return mask, 0
+    seeds[mask == 0] = 1
+    ws = cv2.watershed(cv2.merge([mask.astype(np.uint8) * 255] * 3), seeds)
+    out = ((ws > 1) & (mask > 0)).astype(np.uint8)   # ws == -1 are cut lines
+    # Objects that had no seed (small leaves fully eroded) are restored as-is
+    unseeded = (mask > 0) & (ws <= 1) & (cv2.dilate((ws == -1).astype(np.uint8), disk(1)) == 0)
+    out |= unseeded.astype(np.uint8)
+    return out, int(extra)
+
+
+def measure_card_height(card: np.ndarray) -> float:
+    """Vertical extent (px) of the red card, as the median over the central
+    columns. Leaves lying on the card do not affect it (only the top-most
+    and bottom-most card pixels in each column are used)."""
+    h, w = card.shape
+    ext = []
+    for x in range(int(w * 0.35), int(w * 0.65), 10):
+        ys = np.flatnonzero(card[:, x])
+        if ys.size > 0.2 * h:
+            ext.append(ys[-1] - ys[0] + 1)
+    return float(np.median(ext)) if ext else float("nan")
+
+
+def leaf_solidity(mask: np.ndarray) -> float:
+    cnts, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return float("nan")
+    c = max(cnts, key=cv2.contourArea)
+    hull_area = cv2.contourArea(cv2.convexHull(c))
+    return float(mask.sum() / hull_area) if hull_area > 0 else float("nan")
+
+
+def long_thin_components(mask: np.ndarray, min_length: float, min_elongation: float) -> np.ndarray:
+    """Return the components of a 0/1 mask that are long (minAreaRect long side
+    >= min_length px) and thin (long/short side >= min_elongation, or a low
+    fill of their rotated box, as for curved or branching veins)."""
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    out = np.zeros(mask.shape, np.uint8)
+    for i in range(1, n):
+        x, y, bw, bh, area = st[i]
+        if max(bw, bh) < min_length * 0.7:
+            continue
+        pts = np.column_stack(np.nonzero(lab[y:y + bh, x:x + bw] == i))[:, ::-1].astype(np.float32)
+        (_, _), (a, b), _ = cv2.minAreaRect(pts)
+        long_side, short_side = max(a, b), max(min(a, b), 1.0)
+        fill = area / max(a * b, 1.0)
+        if long_side >= min_length and (long_side / short_side >= min_elongation or fill < 0.25):
+            out[lab == i] = 1
+    return out
+
+
+def robust_sd(x: np.ndarray) -> float:
+    if x.size == 0:
+        return float("nan")
+    med = np.median(x)
+    return float(1.4826 * np.median(np.abs(x - med)))
+
+
+def masked_smooth(values: np.ndarray, weight: np.ndarray, sigma: float, work_scale: float = 0.25) -> np.ndarray:
+    """Normalised convolution: Gaussian-smooth `values` using only pixels where
+    weight > 0, filling gaps (e.g. under leaves) from the surroundings."""
+    h, w = values.shape
+    v = cv2.resize(values * weight, None, fx=work_scale, fy=work_scale, interpolation=cv2.INTER_AREA)
+    m = cv2.resize(weight.astype(np.float32), None, fx=work_scale, fy=work_scale, interpolation=cv2.INTER_AREA)
+    s = max(1.0, sigma * work_scale)
+    num = cv2.GaussianBlur(v, (0, 0), s)
+    den = cv2.GaussianBlur(m, (0, 0), s)
+    # Second, wider pass fills any remaining large gaps
+    num2 = cv2.GaussianBlur(v, (0, 0), s * 4)
+    den2 = cv2.GaussianBlur(m, (0, 0), s * 4)
+    fine = num / np.maximum(den, 1e-6)
+    coarse = num2 / np.maximum(den2, 1e-6)
+    alpha = np.clip(den / 0.5, 0.0, 1.0)            # smooth blend, no hard edges
+    out = alpha * fine + (1.0 - alpha) * coarse
+    return cv2.resize(out.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
+@dataclass
+class ImageResult:
+    leaf_rows: list
+    summary: dict
+    overlay: np.ndarray
+    debug: dict
+
+
+def analyse_image(path: Path, cfg: dict, capture: list | None = None) -> ImageResult:
+    """Analyse one image. If `capture` is a list, per-leaf pixel arrays are
+    appended to it (used by calibrate_controls.py)."""
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError("could not read image")
+    f = img.astype(np.float32)
+    B, G, R = f[..., 0], f[..., 1], f[..., 2]
+    h, w = B.shape
+    sc, sg, ff, dp = cfg["scale"], cfg["segmentation"], cfg["flat_field"], cfg["deposits"]
+    warnings: list[str] = []
+
+    saturated = (img >= sg["saturation_level"]).any(axis=2)
+
+    # 1) lit region -------------------------------------------------------
+    lit_small = cv2.resize(((B + G + R) >= sc["illum_min_sum"]).astype(np.uint8), None,
+                           fx=0.25, fy=0.25, interpolation=cv2.INTER_NEAREST)
+    lit_small = largest_component(cv2.morphologyEx(lit_small, cv2.MORPH_CLOSE, disk(4)))
+    lit_small = fill_holes(lit_small)
+    lit = cv2.resize(lit_small, (w, h), interpolation=cv2.INTER_NEAREST)
+    cnts, _ = cv2.findContours(lit_small, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    illum_diam_px = np.nan
     if cnts:
-        cnt = max(cnts, key=cv2.contourArea)
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        illum_diam = float(max(bw, bh)) / scale
+        (_, _), rad = cv2.minEnclosingCircle(max(cnts, key=cv2.contourArea))
+        illum_diam_px = 2.0 * rad / 0.25
+        x, y, bw, bh = cv2.boundingRect(max(cnts, key=cv2.contourArea))
+        if sc["method"] == "illumination_circle" and (
+                x <= 1 or y <= 1 or (x + bw) >= lit_small.shape[1] - 1 or (y + bh) >= lit_small.shape[0] - 1):
+            warnings.append("lit circle touches image border (scale may be wrong)")
+
+    # 2) background card --------------------------------------------------
+    ratio = (R + 1.0) / (B + 1.0)
+    card_height_px = measure_card_height(((ratio > sg["card_ratio_min"]) & (lit > 0)).astype(np.uint8))
+
+    if sc["method"] == "fixed":
+        px_per_cm = float(sc["px_per_cm"])
+    elif sc["method"] == "card_height":
+        px_per_cm = card_height_px / float(sc["card_height_cm"])
+    elif sc["method"] == "illumination_circle":
+        px_per_cm = illum_diam_px / float(sc["illum_diameter_cm"])
     else:
-        illum_diam = 0.0
+        raise ValueError(f"unknown scale.method '{sc['method']}'")
+    cm2_per_px = 1.0 / px_per_cm**2 if np.isfinite(px_per_cm) and px_per_cm > 0 else np.nan
 
-    # Per-image scale (handles zoom changes)
-    px_per_cm = illum_diam / ILLUM_DIAMETER_CM if ILLUM_DIAMETER_CM > 0 else np.nan
-    cm2_per_px = (1.0 / (px_per_cm ** 2)) if px_per_cm and px_per_cm > 0 else np.nan
+    card = ((ratio > sg["card_ratio_min"]) & (lit > 0) & ~saturated).astype(np.uint8)
+    card = cv2.morphologyEx(card, cv2.MORPH_OPEN, disk(2))
+    # Leaves lying across the card (tip to petiole) split the visible red area
+    # into several pieces, so keep every large piece, not just the largest.
+    n_c, lab_c, st_c, _ = cv2.connectedComponentsWithStats(card, connectivity=8)
+    min_piece = 0.005 * h * w
+    keep_c = [i for i in range(1, n_c) if st_c[i, cv2.CC_STAT_AREA] >= min_piece]
+    card = np.isin(lab_c, keep_c).astype(np.uint8)
+    if card.sum() == 0:
+        raise RuntimeError("background card not found (check segmentation.card_ratio_min)")
+    cnts, _ = cv2.findContours(card, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    hull = cv2.convexHull(np.vstack(cnts))
+    sample_area = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(sample_area, [hull], 1)
+    sample_area = erode(sample_area & lit, int(sg["card_edge_margin_px"]))
 
-    # Smooth + fill holes on the small mask
-    k_close = max(3, int(round(31 * scale)) | 1)  # odd, >=3
-    illum_small = cv2.morphologyEx(
-        illum_small, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
-    )
-    illum_small = fill_holes(illum_small)
+    # 3) leaves -----------------------------------------------------------
+    leaf = ((ratio < sg["leaf_ratio_max"]) & (sample_area > 0) & ~saturated).astype(np.uint8)
+    # Opening removes specks; no closing step, because closing can bridge
+    # narrow gaps between neighbouring leaves. Holes are filled per object.
+    leaf = cv2.morphologyEx(leaf, cv2.MORPH_OPEN, disk(2))
+    leaf = fill_holes(leaf) & sample_area
+    min_leaf_px = (sg["min_leaf_area_cm2"] / cm2_per_px) if np.isfinite(cm2_per_px) else 20000
+    leaf, n_split = split_touching(leaf, int(sg["split_erode_px"]), min_leaf_px * 0.15)
+    if n_split:
+        warnings.append(f"{n_split} touching-leaf contact(s) split - check overlay")
+    n, lab, st, cen = cv2.connectedComponentsWithStats(leaf, connectivity=4)
+    leaf_ids = [i for i in range(1, n) if st[i, cv2.CC_STAT_AREA] >= min_leaf_px]
+    # sort top-to-bottom, then left-to-right for stable numbering
+    leaf_ids.sort(key=lambda i: (round(cen[i][1] / (h / 6)), cen[i][0]))
+    edge_band = (sample_area > 0) & (erode(sample_area, 3) == 0)
 
-    # Shrink on the small mask
-    shrink_small = max(1, int(round(ILLUM_SHRINK_PX * scale)))
-    illum_shrunk_small = shrink_mask_erode(illum_small, shrink_small)
-
-    # Resize masks back to full resolution for downstream steps + overlays
-    illum = cv2.resize(illum_small, (w, h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
-    illum_shrunk = cv2.resize(illum_shrunk_small, (w, h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
-
-    # 2) Leaf ROIs within shrunk illumination: Red <= 120
-    leaf0 = ((r <= LEAF_RED_MAX) & (illum_shrunk > 0)).astype(np.uint8)
-
-    # Light cleanup similar to ImageJ open/close (tune if needed)
-    leaf0 = cv2.morphologyEx(leaf0, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-    leaf0 = cv2.morphologyEx(leaf0, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
-
-    n, labels, stats, _ = connected_components(leaf0)
-    leaf_masks = []
-    for lab in range(1, n):
-        area = int(stats[lab, cv2.CC_STAT_AREA])
-        if area >= MIN_LEAF_AREA_PX:
-            m = (labels == lab).astype(np.uint8)
-            leaf_masks.append((lab, m, area))
-
-    total_leaves = len(leaf_masks)
-
-    # Visual base: Blue channel grayscale -> BGR
-    vis = cv2.cvtColor(b, cv2.COLOR_GRAY2BGR)
-
-    rows = []
-    if total_leaves == 0:
-        rows.append(dict(
-            filename=path.name,
-            illumination_diameter_px=illum_diam,
-            total_leaves=0,
-            leaf_id=0,
-            leaf_area_px=0,
-            fluorescence_area_px=0,
-            fluorescence_blob_count=0,
-            leaf_coverage_pct=0.0
-        ))
+    # 4) flat field from card fluorescence ---------------------------------
+    if ff["enabled"]:
+        card_ref = (card > 0) & (erode(sample_area, 0) > 0) & (cv2.dilate(leaf, disk(8)) == 0)
+        illum_map = masked_smooth(R, card_ref.astype(np.float32), ff["smoothing_sigma_px"])
+        card_level = float(np.median(R[card_ref])) if card_ref.any() else np.nan
+        # Normalise to a fixed card level so that corrected blue values (and
+        # hence thresholds) are comparable between images, despite exposure
+        # or UV-output differences.
+        target = float(ff["card_reference_level"]) if ff.get("normalise_between_images", True) else card_level
+        illum_map = np.clip(illum_map / max(target, 1e-6), 0.1, 10.0)
     else:
-        for i, (_lab, leaf_m, leaf_area) in enumerate(leaf_masks, start=1):
-            # 3) fluorescence within leaf: Blue >= 35
-            fluor0 = ((b >= FLUOR_BLUE_MIN) & (leaf_m > 0)).astype(np.uint8)
+        illum_map = np.ones_like(B)
+        card_level = float(np.median(R[card > 0]))
+    Bc = B / illum_map
 
-            # filter tiny fluorescence blobs
-            nf, flab, fstats, _ = connected_components(fluor0)
+    # 5) deposits ---------------------------------------------------------
+    leaf_all = np.isin(lab, leaf_ids)
+    leaf_core = erode(leaf_all.astype(np.uint8), int(dp["leaf_edge_exclusion_px"])) > 0
+    # Colour (G/B) is evaluated on smoothed channels: JPEG 4:2:0 stores colour
+    # at half resolution, so per-pixel colour ratios at sharp edges (midribs,
+    # veins) are unreliable and create false 'tracer-coloured' fringes.
+    cs = float(dp.get("colour_blur_sigma", 0.8))
+    Bs = cv2.GaussianBlur(B, (0, 0), cs)
+    Gs = cv2.GaussianBlur(G, (0, 0), cs)
+    gb = (Gs + 1.0) / (Bs + 1.0)
 
-            # areas for labels 1..nf-1 (skip background)
-            areas = fstats[1:, cv2.CC_STAT_AREA]
-            keep = areas >= MIN_FLUOR_BLOB_AREA_PX
+    if dp["method"] == "local":
+        # Median background computed on leaf pixels only (non-leaf replaced by
+        # the leaf median so the filter is not pulled up by the bright card).
+        fill_val = float(np.median(Bc[leaf_core])) if leaf_core.any() else 0.0
+        tmp = np.where(leaf_all, Bc, fill_val).astype(np.float32)
+        ws = 0.5
+        k = int(dp["background_window_px"] * ws) | 1
+        small = cv2.resize(tmp, None, fx=ws, fy=ws, interpolation=cv2.INTER_AREA)
+        bg = cv2.medianBlur(np.clip(small, 0, 255).astype(np.uint8), max(3, min(k, 255)))
+        bg = cv2.resize(bg.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+        resid = Bc - bg
+    elif dp["method"] == "absolute":
+        resid = Bc - float(dp["absolute_threshold"])
+    else:
+        raise ValueError(f"unknown deposits.method '{dp['method']}'")
 
-            blob_count = int(keep.sum())
-            fluor_area = int(areas[keep].sum())
+    vis_base = img.copy()
+    leaf_rows = []
+    deposit_all = np.zeros((h, w), np.uint8)
+    for out_id, li in enumerate(leaf_ids, start=1):
+        lm = lab == li
+        core = lm & leaf_core
+        if core.sum() == 0:
+            continue
+        if dp["method"] == "local":
+            sd = robust_sd(resid[core])
+            thr = max(dp["k_sigma"] * sd, dp["min_delta"])
+            cand = core & (resid >= thr)
+        else:
+            sd, thr = robust_sd(Bc[core]), float(dp["absolute_threshold"])
+            cand = core & (resid >= 0)
+        gb_leaf = float(np.median(gb[core]))
+        if dp["colour_filter"]:
+            cand &= gb >= (gb_leaf + dp["green_blue_margin"])
+        vein_px = 0
+        if dp.get("vein_filter", False):
+            # Veins/midribs/creases: long, thin structures brighter than the
+            # leaf. Found with a looser threshold (no colour test); candidates
+            # touching them are rejected.
+            loose = (core & (resid >= dp.get("vein_threshold_fraction", 0.5) * thr)).astype(np.uint8)
+            veins = long_thin_components(loose, dp.get("vein_min_length_px", 60),
+                                         dp.get("vein_min_elongation", 4.0))
+            veins = cv2.dilate(veins, disk(int(dp.get("vein_dilate_px", 3)))) > 0
+            vein_px = int((veins & core).sum())
+            n_v, lab_v = cv2.connectedComponents(cand.astype(np.uint8), connectivity=8)
+            bad = np.unique(lab_v[veins & (lab_v > 0)])
+            cand &= ~np.isin(lab_v, bad)
+        dep, n_dep, dep_areas = remove_small(cand, int(dp["min_deposit_area_px"]))
+        dep = dep.astype(bool)
+        deposit_all |= dep
+        if capture is not None:
+            capture.append({"filename": path.name, "leaf_id": out_id,
+                            "z": (resid[core] / max(sd, 1e-6)).astype(np.float32),
+                            "delta": resid[core].astype(np.float32),
+                            "dgb": (gb[core] - gb_leaf).astype(np.float32),
+                            "bc": Bc[core].astype(np.float32)})
 
-            # Build a lookup table for labels to keep (fast)
-            lut = np.zeros(nf, dtype=bool)
-            # labels kept are +1 because areas starts at label 1
-            lut[1:][keep] = True
+        leaf_px = int(lm.sum())
+        core_px = int(core.sum())
+        dep_px = int(dep.sum())
+        coverage = 100.0 * dep_px / core_px if core_px else 0.0
+        # Flag only substantial contact with the card edge (a petiole or
+        # leaf tip crossing the edge is harmless).
+        contact_len = (lm & edge_band).sum() / 3.0          # edge band is 3 px wide
+        leaf_cnts = cv2.findContours(lm.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
+        perimeter = cv2.arcLength(max(leaf_cnts, key=cv2.contourArea), True)
+        touches_edge = bool(contact_len > 0.02 * perimeter)
+        solidity = leaf_solidity(lm)
+        leaf_rows.append({
+            "filename": path.name,
+            "leaf_id": out_id,
+            "leaf_area_px": leaf_px,
+            "leaf_area_cm2": leaf_px * cm2_per_px,
+            "analysed_area_px": core_px,
+            "deposit_area_px": dep_px,
+            "deposit_area_cm2": dep_px * cm2_per_px,
+            "coverage_pct": coverage,
+            "deposit_count": n_dep,
+            "deposits_per_cm2": n_dep / (core_px * cm2_per_px) if core_px and np.isfinite(cm2_per_px) else np.nan,
+            "median_deposit_area_px": float(np.median(dep_areas)) if n_dep else 0.0,
+            "leaf_background_blue": float(np.median(Bc[core])),
+            "leaf_noise_sd": sd,
+            "threshold_used": thr,
+            "leaf_green_blue": gb_leaf,
+            "excess_fluorescence_sum": float(np.clip(resid[dep], 0, None).sum()),
+            "mean_illum_factor": float(np.mean(illum_map[core])),
+            "touches_card_edge": touches_edge,
+            "solidity": solidity,
+            "vein_excluded_px": vein_px,
+        })
+        if touches_edge:
+            warnings.append(f"leaf {out_id} touches the card edge (part may be excluded)")
+        if np.isfinite(solidity) and solidity < sg.get("min_solidity", 0.85):
+            warnings.append(f"leaf {out_id} irregular outline (solidity {solidity:.2f}): "
+                            f"possibly overlapping leaves or a damaged leaf - check overlay")
 
-            fluor_clean = lut[flab].astype(np.uint8)
+    if not leaf_rows:
+        warnings.append("no leaves detected")
+    frac_sat = float(saturated[leaf_all].mean()) if leaf_all.any() else 0.0
+    blue_med = float(np.median(B[leaf_all])) if leaf_all.any() else np.nan
+    if np.isfinite(blue_med) and blue_med < 50:
+        warnings.append(f"leaf blue level low ({blue_med:.0f}/255): image under-exposed, weak deposit contrast")
+
+    tot_core = sum(r["analysed_area_px"] for r in leaf_rows)
+    tot_dep = sum(r["deposit_area_px"] for r in leaf_rows)
+    summary = {
+        "filename": path.name,
+        "n_leaves": len(leaf_rows),
+        "px_per_cm": px_per_cm,
+        "scale_method": sc["method"],
+        "card_height_px": card_height_px,
+        "illumination_diameter_px": illum_diam_px,
+        "total_leaf_area_cm2": sum(r["leaf_area_cm2"] for r in leaf_rows),
+        "pooled_coverage_pct": 100.0 * tot_dep / tot_core if tot_core else np.nan,
+        "detection_limit_pct": dp.get("detection_limit_pct"),
+        "mean_leaf_coverage_pct": float(np.mean([r["coverage_pct"] for r in leaf_rows])) if leaf_rows else np.nan,
+        "total_deposit_count": sum(r["deposit_count"] for r in leaf_rows),
+        "leaf_raw_blue_median": blue_med,
+        "card_red_median": card_level,
+        "leaf_saturated_fraction": frac_sat,
+        "deposit_method": dp["method"],
+        "warnings": "; ".join(warnings),
+    }
+
+    # 6) QC overlay -------------------------------------------------------
+    vis = cv2.convertScaleAbs(vis_base, alpha=2.0, beta=0)   # brighten for viewing
+    vis[deposit_all > 0] = (255, 0, 255)                      # deposits: magenta
+    hull_c, _ = cv2.findContours(sample_area, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(vis, hull_c, -1, (0, 255, 255), 3)       # sample area: yellow
+    for out_id, li in enumerate(leaf_ids, start=1):
+        lm = (lab == li).astype(np.uint8)
+        c, _ = cv2.findContours(lm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, c, -1, (0, 255, 0), 3)          # leaves: green
+        cx, cy = map(int, cen[li])
+        cov = next((r["coverage_pct"] for r in leaf_rows if r["leaf_id"] == out_id), 0.0)
+        label = f"{out_id}: {cov:.1f}%"
+        for col, th in (((0, 0, 0), 8), ((255, 255, 255), 3)):
+            cv2.putText(vis, label, (cx - 90, cy), cv2.FONT_HERSHEY_SIMPLEX, 1.6, col, th, cv2.LINE_AA)
+    s = float(cfg["output"]["overlay_scale"])
+    if s != 1.0:
+        vis = cv2.resize(vis, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+
+    debug = {}
+    if cfg["output"]["save_debug_images"]:
+        debug["flatfield"] = cv2.normalize(illum_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        r8 = np.clip(resid * 8 + 128, 0, 255).astype(np.uint8)
+        r8[~leaf_all] = 0
+        debug["residual"] = r8
+    return ImageResult(leaf_rows, summary, vis, debug)
 
 
-            coverage = (100.0 * fluor_area / leaf_area) if leaf_area > 0 else 0.0
-
-            leaf_area_cm2 = leaf_area * cm2_per_px if np.isfinite(cm2_per_px) else np.nan
-            fluor_area_cm2 = fluor_area * cm2_per_px if np.isfinite(cm2_per_px) else np.nan
-
-
-            # fill fluorescence in red
-            vis[fluor_clean > 0] = (0, 0, 255)
-
-            rows.append(dict(
-                filename=path.name,
-                illumination_diameter_px=illum_diam,
-                illumination_diameter_cm=ILLUM_DIAMETER_CM,
-                px_per_cm=px_per_cm,
-                total_leaves=total_leaves,
-                leaf_id=i,
-                leaf_area_px=leaf_area,
-                leaf_area_cm2=leaf_area_cm2,
-                fluorescence_area_px=fluor_area,
-                fluorescence_area_cm2=fluor_area_cm2,
-                fluorescence_blob_count=blob_count,
-                leaf_coverage_pct=coverage
-            ))
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Quantify fluorescent spray coverage on leaf images.")
+    p.add_argument("--config", type=Path, default=REPO_ROOT / "config.yaml", help="YAML config (default: repo config.yaml)")
+    p.add_argument("--input", type=Path, help="folder of raw images (overrides config)")
+    p.add_argument("--output", type=Path, help="folder for CSV outputs (overrides config)")
+    p.add_argument("--processed", type=Path, help="folder for QC overlays (overrides config)")
+    p.add_argument("--debug", action="store_true", help="also save flat-field and residual images")
+    p.add_argument("--metadata", type=Path, help="trial spreadsheet (.xlsx/.csv) to join on photo number")
+    p.add_argument("--sheet", help="sheet name in the metadata workbook (e.g. Cherry)")
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p.parse_args(argv)
 
 
-    # 4/5) overlays: illum outline yellow, leaf outlines green
-    # Pre-shrink illumination (cyan)
-    vis = draw_contours(vis, illum, (255, 255, 0), thickness=2)
+def apply_detection_limit(leaf: pd.DataFrame, img: pd.DataFrame, dp: dict):
+    """Set above_detection_limit using a single limit or one per stratum
+    (e.g. per Leaf_side), as configured."""
+    if leaf.empty:
+        return leaf, img
+    by = dp.get("detection_limit_by")
+    values = dp.get("detection_limit_values") or {}
+    default = dp.get("detection_limit_pct")
+    if by and by in leaf.columns and values:
+        lim = leaf[by].map(lambda v: values.get(str(v), default))
+    else:
+        lim = pd.Series(default, index=leaf.index)
+    leaf["detection_limit_pct"] = lim
+    leaf["above_detection_limit"] = np.where(lim.notna(), leaf["coverage_pct"] > lim.astype(float), np.nan)
+    if not img.empty and "filename" in img.columns:
+        frac = leaf.groupby("filename")["above_detection_limit"].mean()
+        img["pct_leaves_above_LOD"] = img["filename"].map(100 * frac)
+    return leaf, img
 
-    # Post-shrink illumination (yellow)
-    vis = draw_contours(vis, illum_shrunk, (0, 255, 255), thickness=3)
 
-    for leaf_id, (_lab, leaf_m, _area) in enumerate(leaf_masks, start=1):
-        vis = draw_contours(vis, leaf_m, (0, 255, 0), thickness=2)  # green outline
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(message)s")
+    cfg = load_config(args.config)
+    if args.debug:
+        cfg["output"]["save_debug_images"] = True
 
-        c = mask_centroid_xy(leaf_m)
-        if c is not None:
-            x, y = c
-            # draw a small black shadow for readability, then white text
-            cv2.putText(vis, str(leaf_id), (x - 10, y + 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(vis, str(leaf_id), (x - 10, y + 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 2, cv2.LINE_AA)
+    # Command-line paths are relative to the current folder; config paths are
+    # relative to the repository root.
+    raw_dir = args.input.resolve() if args.input else resolve(cfg["paths"]["raw_dir"])
+    out_dir = args.output.resolve() if args.output else resolve(cfg["paths"]["outputs_dir"])
+    proc_dir = args.processed.resolve() if args.processed else resolve(cfg["paths"]["processed_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    proc_dir.mkdir(parents=True, exist_ok=True)
 
+    log.info("Input folder : %s", raw_dir)
+    log.info("Outputs      : %s", out_dir)
+    log.info("QC overlays  : %s", proc_dir)
+    if not raw_dir.is_dir():
+        log.error("Input folder does not exist: %s", raw_dir)
+        return 1
+    images = sorted(p for p in raw_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS and p.is_file())
+    log.info("Found %d image(s)", len(images))
+    if not images:
+        log.error("No images found. Supported extensions: %s", ", ".join(sorted(IMAGE_EXTS)))
+        return 1
 
-    return rows, vis
-
-def main():
-    ensure_dirs()
-    imgs = sorted({
-    p.resolve() for ext in ("*.jpg", "*.JPG", "*.jpeg", "*.JPEG")
-    for p in RAW_DIR.glob(ext)
-    })
-    all_rows = []
-
-    for p in imgs:
+    leaf_rows, summaries = [], []
+    for i, p in enumerate(images, 1):
         try:
-            rows, vis = analyse_image(p)
-            all_rows.extend(rows)
-            out_img = PROCESSED_DIR / f"{p.stem}{OUT_SUFFIX}"
-            cv2.imwrite(str(out_img), vis)
-            print(f"Processed {p.name} -> {out_img}")
-        except Exception as e:
-            all_rows.append(dict(
-                filename=p.name,
-                illumination_diameter_px=float("nan"),
-                total_leaves=0,
-                leaf_id=0,
-                leaf_area_px=0,
-                fluorescence_area_px=0,
-                fluorescence_blob_count=0,
-                leaf_coverage_pct=0.0,
-                error=str(e)
-            ))
-            print(f"ERROR {p.name}: {e}")
+            res = analyse_image(p, cfg)
+            leaf_rows.extend(res.leaf_rows)
+            summaries.append(res.summary)
+            cv2.imwrite(str(proc_dir / f"{p.stem}_qc.jpg"), res.overlay, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            for name, im in res.debug.items():
+                cv2.imwrite(str(proc_dir / f"{p.stem}_{name}.png"), im)
+            msg = f"[{i}/{len(images)}] {p.name}: {res.summary['n_leaves']} leaves, " \
+                  f"pooled coverage {res.summary['pooled_coverage_pct']:.2f}%"
+            log.info(msg + (f"  WARNING: {res.summary['warnings']}" if res.summary["warnings"] else ""))
+        except Exception as e:  # keep going on a bad image
+            log.error("[%d/%d] %s: ERROR %s", i, len(images), p.name, e)
+            summaries.append({"filename": p.name, "n_leaves": 0, "warnings": f"ERROR: {e}"})
 
-    df = pd.DataFrame(all_rows)
-    df.to_csv(CSV_OUT, index=False)
-    print(f"Wrote {CSV_OUT} ({len(df)} rows)")
+    leaf_df, img_df = pd.DataFrame(leaf_rows), pd.DataFrame(summaries)
+    md = cfg.get("metadata", {})
+    meta_path = args.metadata or (resolve(md["path"]) if md.get("path") else None)
+    if meta_path:
+        import metadata as M
+        pattern = md.get("filename_pattern", r"DSCN0*(\d+)")
+        idc = md.get("id_column", "Photo_number")
+        meta = M.load_metadata(meta_path, args.sheet or md.get("sheet"), idc)
+        log.info("Metadata: %s (%d rows)", meta_path, len(meta))
+        issues = M.check_metadata(meta, [p.name for p in images], pattern, idc)
+        issues.to_csv(out_dir / "metadata_issues.csv", index=False)
+        leaf_df = M.attach(leaf_df, meta, pattern, idc)
+        img_df = M.attach(img_df, meta, pattern, idc)
+    leaf_df, img_df = apply_detection_limit(leaf_df, img_df, cfg["deposits"])
+    if meta_path and not img_df.empty:
+        factors = md.get("summary_factors", ["Spray_rate", "Canopy_location", "Leaf_side"])
+        tabs = []
+        for k in range(1, len(factors) + 1):
+            t = M.treatment_summary(img_df, leaf_df, factors[:k])
+            if not t.empty:
+                t.insert(0, "grouping", " x ".join(factors[:k]))
+                tabs.append(t)
+        if tabs:
+            pd.concat(tabs, ignore_index=True).to_csv(out_dir / "treatment_summary.csv", index=False)
+            log.info("Wrote %s", out_dir / "treatment_summary.csv")
+
+    leaf_csv = out_dir / "leaf_coverage_results.csv"
+    summ_csv = out_dir / "image_summary.csv"
+    leaf_df.to_csv(leaf_csv, index=False)
+    img_df.to_csv(summ_csv, index=False)
+    with open(out_dir / "config_used.yaml", "w", encoding="utf-8") as fh:
+        if yaml is not None:
+            yaml.safe_dump(cfg, fh, sort_keys=False)
+    log.info("Wrote %s (%d leaves)", leaf_csv, len(leaf_rows))
+    log.info("Wrote %s (%d images)", summ_csv, len(summaries))
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
