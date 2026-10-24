@@ -108,7 +108,7 @@ deposits:
   vein_dilate_px: 3
   detection_limit_by: null       # e.g. Leaf_side, to use a limit per stratum
   detection_limit_values: null   # e.g. {Upper: 0.05, Under: 0.08}
-  detection_limit_pct: 0.05  # from 18 control images (59 leaves), envelope
+  detection_limit_pct: 0.001  # from 18 control images (59 leaves), envelope
                              # method: p95 of false positives = 0.043%
                              # (bootstrap 95% CI 0.020-0.051%); rounded up. Re-run
                              # calibrate_controls.py when settings change.

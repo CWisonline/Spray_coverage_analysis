@@ -1,44 +1,34 @@
 CONTROL CALIBRATION REPORT
 ============================================================
-Images: 44   Leaves: 140   Pixels: 116,569,250
+Images: 12   Leaves: 120   Pixels: 16,847,545
 Settings: k_sigma=3.0, min_delta=6.0, green_blue_margin=0.03, colour_blur_sigma=2.5, min_deposit_area_px=5, vein_filter=False
 
 Leaf background (flat-field corrected blue; card normalised to 100.0):
-  min 26.4  p25 35.1  median 47.3  p75 56.5  max 78.0
-  99.9th percentile of corrected blue per leaf: 34 - 170
+  min 29.6  p25 35.5  median 46.5  p75 70.5  max 119.7
+  99.9th percentile of corrected blue per leaf: 45 - 155
   -> a single absolute threshold is only usable if this range is narrow.
 
 False-positive coverage on control leaves (current settings):
-  mean of leaves 0.0045%
-  median 0.0000%  p95 0.0147%  max 0.2110%
-  leaves with zero detections: 116 / 140
+  mean of leaves 0.0025%
+  median 0.0000%  p95 0.0010%  max 0.0818%
+  leaves with zero detections: 114 / 120
 
-RECOMMENDED detection limit (p95 of per-leaf false positives): 0.015%
-  -> set deposits.detection_limit_pct: 0.015 in config.yaml
+RECOMMENDED detection limit (p95 of per-leaf false positives): 0.001%
+  -> set deposits.detection_limit_pct: 0.001 in config.yaml
 
 Detection limit by Leaf_side (p95; 95% CI from resampling images):
-  Under      images  22 leaves   70  background median  56.5  LOD 0.026% (CI 0.004-0.129%)
-  Upper      images  22 leaves   70  background median  35.1  LOD 0.009% (CI 0.000-0.024%)
-  Suggested config (upper CI used, conservative):
-    detection_limit_by: Leaf_side
-    detection_limit_values: {Under: 0.129, Upper: 0.024}
-
-Comparison by UV_filter (does it change the unsprayed baseline?):
-                     images  leaves  background_median  noise_sd_median  fp_mean_pct  fp_p95_pct
-Leaf_side UV_filter                                                                             
-Under     Off             6      20             54.112            4.375        0.005       0.015
-          On             16      50             58.275            3.745        0.008       0.026
-Upper     Off             6      20             32.949            2.562        0.004       0.025
-          On             16      50             36.029            2.765        0.001       0.004
+  Top        images   6 leaves   60  background median  35.5  LOD 0.001% (CI 0.000-0.034%)  <- fewer than 10 images: not reliable, not suggested
+  Under      images   6 leaves   60  background median  70.5  LOD 0.003% (CI 0.000-0.062%)  <- fewer than 10 images: not reliable, not suggested
+  No stratum has >= 10 control images; keep the single detection_limit_pct.
 
 Pixel exceedance on control leaves (% of pixels; before size filter):
              gb_margin=0.0  gb_margin=0.01  gb_margin=0.02  gb_margin=0.03  gb_margin=0.04  gb_margin=0.05
-k_sigma=3.0         2.7951          0.6247          0.1264          0.0230          0.0043          0.0012
-k_sigma=3.5         1.4089          0.3295          0.0724          0.0153          0.0032          0.0010
-k_sigma=4.0         0.7831          0.2003          0.0478          0.0110          0.0025          0.0008
-k_sigma=4.5         0.4856          0.1411          0.0360          0.0085          0.0019          0.0006
-k_sigma=5.0         0.3304          0.1071          0.0282          0.0066          0.0016          0.0006
-k_sigma=6.0         0.1864          0.0671          0.0179          0.0039          0.0010          0.0004
+k_sigma=3.0         0.6376          0.0924          0.0141          0.0038          0.0020          0.0010
+k_sigma=3.5         0.2985          0.0517          0.0088          0.0029          0.0017          0.0008
+k_sigma=4.0         0.1435          0.0299          0.0059          0.0022          0.0015          0.0008
+k_sigma=4.5         0.0736          0.0174          0.0036          0.0017          0.0013          0.0007
+k_sigma=5.0         0.0392          0.0101          0.0026          0.0014          0.0012          0.0006
+k_sigma=6.0         0.0126          0.0034          0.0014          0.0010          0.0009          0.0005
 
 Caveats: the limit applies only to images taken with the same camera
 settings, card, tracer and leaf surface as the controls. Re-run when
