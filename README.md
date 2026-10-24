@@ -112,7 +112,9 @@ Plot (and Tree) as random effects, since leaves and images are sub-samples.
 4. **Detection limit**: coverage at or below `detection_limit_pct` cannot be
    distinguished from an unsprayed leaf (`above_detection_limit` column).
 5. **Scale**: `card_height` (default) uses the measured height of the red
-   A4 card (21.0 cm) in every image (~57 px/cm in the current setup).
+   red card (short side 20.4 cm, measured with a steel ruler) in every
+   image: ~106 px/cm on the 4608 x 3456 originals (checked against a manual
+   ImageJ red-channel measurement on DSCN0907: 106 px/cm).
    The illuminated circle is NOT a valid scale reference (it is set by the
    lens/filter optics and varied ~30% between images while the card varied <3%).
 

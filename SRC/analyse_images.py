@@ -59,7 +59,7 @@ DEFAULT_CONFIG: dict = {
     },
     "scale": {
         "method": "card_height",
-        "card_height_cm": 21.0,
+        "card_height_cm": 20.4,
         "px_per_cm": 96.5,
         "illum_diameter_cm": 18.35,
         "illum_min_sum": 15,
